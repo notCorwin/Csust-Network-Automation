@@ -65,3 +65,6 @@ jobs:
 
           asset_count="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '[.[] | select(.name == "CampusAutoLogin.app.tar" and .label == "CampusAutoLogin.app")] | length')"
           [[ "$asset_count" == "1" ]]
+
+          asset_digest="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '[.[] | select(.name == "CampusAutoLogin.app.tar" and .label == "CampusAutoLogin.app")] | .[0].digest')"
+          [[ "$asset_digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]

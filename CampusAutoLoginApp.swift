@@ -1053,6 +1053,25 @@ final class AutoLoginEngine: @unchecked Sendable {
     }
 }
 
+func updatePublishedAgo(_ date: Date, now: Date = Date()) -> String {
+    let elapsed = now.timeIntervalSince(date)
+    guard elapsed.isFinite, elapsed >= 10 else { return "刚刚" }
+    var remaining = elapsed >= TimeInterval(Int64.max) ? Int64.max : Int64(elapsed)
+    let units: [(Int64, String)] = [
+        (365 * 86400, "年"), (86400, "天"), (3600, "小时"), (60, "分钟"), (1, "秒")
+    ]
+    var parts: [String] = []
+    for (seconds, name) in units {
+        let count = remaining / seconds
+        if count > 0 {
+            parts.append("\(count) \(name)")
+            remaining %= seconds
+        }
+        if parts.count == 2 { break }
+    }
+    return parts.joined(separator: " ") + "前"
+}
+
 @MainActor
 final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = AppModel()
@@ -1064,6 +1083,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     @Published private(set) var diagnosticText = ""
     @Published private(set) var launchStatus = ""
     @Published private(set) var updateStatus = AppUpdateStatus.idle
+    @Published private var updateNow = Date()
 
     private let store: AppStore
     private let updater = AppUpdater()
@@ -1073,6 +1093,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.csustautologin.path")
     private var updateCheckTimer: Timer?
+    private var updateDisplayTimer: Timer?
+    private var lastUpdatePublishedAt: Date?
     private var connectivityTimer: Timer?
     private var started = false
     private var isCheckingForUpdate = false
@@ -1125,9 +1147,16 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
         pathMonitor.start(queue: pathQueue)
-        updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 3 * 60, repeats: true) { [weak self] _ in
+        let updateCheckTimer = Timer(timeInterval: 3 * 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.checkForUpdates(silently: true) }
         }
+        RunLoop.main.add(updateCheckTimer, forMode: .common)
+        self.updateCheckTimer = updateCheckTimer
+        let updateDisplayTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.updateNow = Date() }
+        }
+        RunLoop.main.add(updateDisplayTimer, forMode: .common)
+        self.updateDisplayTimer = updateDisplayTimer
         connectivityTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
@@ -1147,6 +1176,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     func stop() {
         updateCheckTimer?.invalidate()
         updateCheckTimer = nil
+        updateDisplayTimer?.invalidate()
+        updateDisplayTimer = nil
         connectivityTimer?.invalidate()
         connectivityTimer = nil
         pathMonitor.cancel()
@@ -1234,16 +1265,16 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
     }
 
-    func menuDidOpen() {
-        checkForUpdates(silently: true)
-    }
-
     func checkForUpdatesNow() {
         checkForUpdates(silently: false)
     }
 
     var updateMenuTitle: String {
-        isInstallingUpdate ? "正在安装更新…" : updateStatus.title
+        if isInstallingUpdate { return "正在安装更新…" }
+        guard case .available = updateStatus, let lastUpdatePublishedAt else {
+            return updateStatus.title
+        }
+        return "\(updateStatus.title) · \(updatePublishedAgo(lastUpdatePublishedAt, now: updateNow))发布"
     }
 
     var updateActionEnabled: Bool {
@@ -1260,6 +1291,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
             switch result {
             case .success(let update):
+                lastUpdatePublishedAt = update?.publishedAt
                 guard let update else {
                     updateStatus = .latest
                     if !silently {
@@ -1270,10 +1302,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
                 updateStatus = .available(String(update.revision.prefix(7)))
                 if !silently {
                     presentUpdate(update)
-                } else {
-                    installUpdate(update, silently: true)
                 }
             case .failure(let error):
+                lastUpdatePublishedAt = nil
                 updateStatus = .failed
                 if !silently {
                     showUpdateAlert(title: "检查更新失败", message: error.localizedDescription)
@@ -1293,25 +1324,12 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         alert.addButton(withTitle: "稍后")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        installUpdate(update, silently: false)
-    }
-
-    private func installUpdate(_ update: AppUpdate, silently: Bool) {
-        guard !isInstallingUpdate else { return }
         isInstallingUpdate = true
         updater.downloadAndInstall(update) { [weak self] result in
             guard let self else { return }
-            switch result {
-            case .success:
-                break
-            case .failure(let error):
+            if case .failure(let error) = result {
                 isInstallingUpdate = false
-                updateStatus = .failed
-                if silently {
-                    diagnosticText = error.localizedDescription
-                } else {
-                    showUpdateAlert(title: "安装更新失败", message: error.localizedDescription)
-                }
+                showUpdateAlert(title: "安装更新失败", message: error.localizedDescription)
             }
         }
     }
@@ -1444,7 +1462,6 @@ struct MenuContent: View {
     var body: some View {
         Text(model.statusText)
             .lineLimit(3)
-            .onAppear { model.menuDidOpen() }
         if !model.state.network.isEmpty {
             Text(model.state.network)
                 .font(.caption)
@@ -1723,6 +1740,9 @@ enum SelfTest {
         var changedConfig = config
         changedConfig.password = "different"
         precondition(configFingerprint(config) != configFingerprint(changedConfig))
+        precondition(AppUpdateStatus.latest.title == "检查更新")
+        precondition(AppUpdateStatus.failed.title == "检查更新")
+        precondition(updatePublishedAgo(Date(timeIntervalSince1970: 0), now: Date(timeIntervalSince1970: 438)) == "7 分钟 18 秒前")
         updateParsing()
         storeMigrationAndPersistence()
         engineCancellationAndMutex()
@@ -1738,6 +1758,7 @@ enum SelfTest {
             """
             {
               "name": "autobuild",
+              "published_at": "2026-09-07T00:00:00Z",
               "target_commitish": "\(revision)",
               "body": "",
               "assets": [{
@@ -1772,8 +1793,15 @@ enum SelfTest {
             preconditionFailure("release metadata must parse")
         }
         precondition(update.revision == revision)
+        precondition(update.expectedSHA256 == digest)
+        precondition(update.publishedAt == Date(timeIntervalSince1970: 1_788_739_200))
         guard case .success(nil) = AppUpdater.parse(data: data, currentRevision: revision) else {
             preconditionFailure("same revision must not update")
+        }
+        let missingDigest = Data(String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: "\"digest\": \"sha256:\(digest)\"", with: "\"digest\": null").utf8)
+        guard case .failure(.invalidResponse) = AppUpdater.parse(data: missingDigest, currentRevision: "development") else {
+            preconditionFailure("release without SHA-256 must be rejected")
         }
     }
 

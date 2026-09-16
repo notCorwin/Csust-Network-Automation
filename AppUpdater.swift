@@ -45,13 +45,15 @@ struct AppUpdate: Sendable {
     let name: String
     let revision: String
     let assetURL: URL
-    let expectedSHA256: String?
+    let expectedSHA256: String
+    let publishedAt: Date?
 
-    init(name: String, revision: String, assetURL: URL, expectedSHA256: String? = nil) {
+    init(name: String, revision: String, assetURL: URL, expectedSHA256: String, publishedAt: Date? = nil) {
         self.name = name
         self.revision = revision
         self.assetURL = assetURL
         self.expectedSHA256 = expectedSHA256
+        self.publishedAt = publishedAt
     }
 }
 
@@ -100,10 +102,8 @@ enum AppUpdateStatus: Equatable {
     var title: String {
         switch self {
         case .idle: return "检查更新"
-        case .checking: return "正在检查更新…"
-        case .latest: return "已是最新版本"
-        case .failed: return "检查更新失败"
-        case .available(let revision): return "有最新版本可用 · 前七位哈希 \(revision)"
+        case .checking, .latest, .failed: return "检查更新"
+        case .available(let revision): return "有最新版本可用 · \(revision)"
         }
     }
 
@@ -173,6 +173,7 @@ final class AppUpdater: @unchecked Sendable {
         let name: String?
         let body: String?
         let targetCommitish: String?
+        let publishedAt: Date?
         let assets: [Asset]
     }
 
@@ -515,6 +516,7 @@ final class AppUpdater: @unchecked Sendable {
         do {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
+            decoder.dateDecodingStrategy = .iso8601
             let release = try decoder.decode(Release.self, from: data)
             guard let asset = release.assets.first(where: { $0.name == Self.assetName }) else {
                 return .failure(AppUpdateError.assetMissing)
@@ -530,11 +532,15 @@ final class AppUpdater: @unchecked Sendable {
             if releaseRevision != "unknown", releaseRevision == revision(in: currentRevision) {
                 return .success(nil)
             }
+            guard let expectedSHA256 else {
+                return .failure(AppUpdateError.invalidResponse)
+            }
             return .success(AppUpdate(
                 name: release.name ?? "autobuild",
                 revision: releaseRevision,
                 assetURL: asset.browserDownloadUrl,
-                expectedSHA256: expectedSHA256
+                expectedSHA256: expectedSHA256,
+                publishedAt: release.publishedAt
             ))
         } catch {
             return .failure(AppUpdateError.invalidResponse)
@@ -917,8 +923,7 @@ final class AppUpdater: @unchecked Sendable {
         }
     }
 
-    private func verifySHA256(of file: URL, expected: String?) throws {
-        guard let expected else { return }
+    private func verifySHA256(of file: URL, expected: String) throws {
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
         var hasher = SHA256()
