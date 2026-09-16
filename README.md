@@ -59,6 +59,8 @@ codesign --verify --deep --strict target/NetworkAuto.app
 
 `build.sh` 包含 Swift 6 严格并发类型检查、编译、App 内置 self-test 和安装事务 self-test。主要逻辑位于 [NetworkAutoApp.swift](NetworkAutoApp.swift)，更新器位于 [AppUpdater.swift](AppUpdater.swift)，构建和安装脚本分别是 [build.sh](build.sh) 与 [install.sh](install.sh)。推送后，[GitHub Actions](.github/workflows/release.yml) 会构建并更新 `autobuild` Release。
 
+App 图标来自 [原始 PNG](Assets/NetworkAutoIcon.png)，构建时使用 [macOS 图标文件](Assets/NetworkAuto.icns)；菜单栏仍显示 🛰️。
+
 ## 获取帮助与贡献
 
 遇到问题请到 [Issues](https://github.com/notCorwin/Csust-Network-Automation/issues) 提交 macOS 版本、机器架构、复现步骤和菜单栏诊断结果。分享诊断或日志前，请先移除账号、密码及不愿公开的网络信息。

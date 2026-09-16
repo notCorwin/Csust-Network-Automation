@@ -9,7 +9,7 @@ APP_REVISION="${APP_REVISION:-development}"
 
 echo "🔨 正在编译 Csust-Network-Automation App..."
 rm -rf "$APP_PATH"
-mkdir -p "$APP_PATH/Contents/MacOS"
+mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typecheck \
 	-target arm64-apple-macosx13.0 \
 	-framework AppKit \
@@ -33,6 +33,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
   -framework UserNotifications \
   -o "$EXECUTABLE" NetworkAutoApp.swift AppUpdater.swift
 cp Info.plist "$APP_PATH/Contents/Info.plist"
+cp Assets/NetworkAuto.icns "$APP_PATH/Contents/Resources/NetworkAuto.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleSourceRevision $APP_REVISION" "$APP_PATH/Contents/Info.plist"
 codesign --force --deep --sign - "$APP_PATH" >/dev/null
 codesign --verify --deep --strict "$APP_PATH"

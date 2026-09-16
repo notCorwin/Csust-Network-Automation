@@ -6,6 +6,8 @@
 	<string>Csust-Network-Automation</string>
 	<key>CFBundleExecutable</key>
 	<string>NetworkAuto</string>
+	<key>CFBundleIconFile</key>
+	<string>NetworkAuto.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.nowaywastaken.csustautologin</string>
 	<key>CFBundleName</key>

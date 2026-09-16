@@ -37,6 +37,7 @@ jobs:
           test -f "target/NetworkAuto.app/Contents/MacOS/NetworkAuto"
           test -x "target/NetworkAuto.app/Contents/MacOS/NetworkAuto"
           test -f "target/NetworkAuto.app/Contents/Info.plist"
+          test -f "target/NetworkAuto.app/Contents/Resources/NetworkAuto.icns"
           test -f NetworkAuto.app.tar
           tar -tf NetworkAuto.app.tar | grep -qx "NetworkAuto.app/Contents/MacOS/NetworkAuto"
 
