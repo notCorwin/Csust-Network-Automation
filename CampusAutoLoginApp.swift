@@ -13,6 +13,7 @@ import UserNotifications
 private let appDisplayName = "校园网自动登录"
 private let campusSSID = "CSUST-Student"
 private let campusLoginURL = URL(string: "https://login.csust.edu.cn:802/eportal/portal/login")!
+private let connectivityURL = URL(string: "https://www.google.com/generate_204")!
 private let loginRequestTimeoutSecs: TimeInterval = 15
 private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
@@ -153,20 +154,18 @@ final class EngineSnapshot: @unchecked Sendable {
     private let lock = NSLock()
     private var networks: [WiFiNetwork] = []
     private var permissionAuthorized = false
-    private var pathSatisfied = false
 
-    func update(networks: [WiFiNetwork], permissionAuthorized: Bool, pathSatisfied: Bool = false) {
+    func update(networks: [WiFiNetwork], permissionAuthorized: Bool) {
         lock.lock()
         self.networks = networks
         self.permissionAuthorized = permissionAuthorized
-        self.pathSatisfied = pathSatisfied
         lock.unlock()
     }
 
-    func read() -> (networks: [WiFiNetwork], permissionAuthorized: Bool, pathSatisfied: Bool) {
+    func read() -> (networks: [WiFiNetwork], permissionAuthorized: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return (networks, permissionAuthorized, pathSatisfied)
+        return (networks, permissionAuthorized)
     }
 }
 
@@ -519,6 +518,28 @@ private final class HTTPResponseBox: @unchecked Sendable {
 }
 
 enum LoginService {
+    static func hasInternetConnectivity(stillConnected: @escaping @Sendable () -> Bool) -> Bool {
+        var request = URLRequest(url: connectivityURL)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        guard case .success(let response) = perform(
+            request: request,
+            route: "system",
+            shouldContinue: stillConnected,
+            systemProxy: nil,
+            timeout: 4
+        ) else { return false }
+        return isConnectivityEvidence(
+            statusCode: response.statusCode,
+            body: response.body,
+            redirectLocation: response.redirectLocation
+        )
+    }
+
+    static func isConnectivityEvidence(statusCode: Int, body: Data, redirectLocation: String?) -> Bool {
+        statusCode == 204 && body.isEmpty && redirectLocation == nil
+    }
+
     static func login(
         config: AppConfig,
         ip: String,
@@ -562,7 +583,6 @@ enum LoginService {
             }
             switch perform(
                 request: request,
-                config: config,
                 route: route,
                 shouldContinue: stillConnected,
                 systemProxy: systemProxy
@@ -614,7 +634,6 @@ enum LoginService {
             ?? URLRequest(url: rootURL)
         switch perform(
             request: request,
-            config: config,
             route: route,
             shouldContinue: { true },
             systemProxy: nil
@@ -642,15 +661,15 @@ enum LoginService {
 
     private static func perform(
         request: URLRequest,
-        config: AppConfig,
         route: String,
         shouldContinue: @escaping @Sendable () -> Bool,
-        systemProxy: URL?
+        systemProxy: URL?,
+        timeout: TimeInterval = loginRequestTimeoutSecs
     ) -> Result<HTTPResult, AppError> {
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.waitsForConnectivity = false
-        sessionConfiguration.timeoutIntervalForRequest = loginRequestTimeoutSecs
-        sessionConfiguration.timeoutIntervalForResource = loginRequestTimeoutSecs
+        sessionConfiguration.timeoutIntervalForRequest = timeout
+        sessionConfiguration.timeoutIntervalForResource = timeout
         sessionConfiguration.httpShouldSetCookies = false
         if route == "direct" {
             sessionConfiguration.connectionProxyDictionary = [
@@ -688,7 +707,7 @@ enum LoginService {
             semaphore.signal()
         }
         task.resume()
-        let deadline = Date().addingTimeInterval(loginRequestTimeoutSecs + 1)
+        let deadline = Date().addingTimeInterval(timeout + 1)
         while semaphore.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
             if !shouldContinue() {
                 task.cancel()
@@ -931,6 +950,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             state.failureSince = nil
             state.notified = false
         }
+        var shouldProbe = true
         while !cancellation.isCancelled() {
             let current = snapshot.read()
             guard current.permissionAuthorized else {
@@ -953,14 +973,23 @@ final class AutoLoginEngine: @unchecked Sendable {
                 state.network = key
                 state.failureSince = nil
                 state.notified = false
+                shouldProbe = true
             }
 
-            guard current.pathSatisfied else {
-                state.route = ""
-                state.attempt = 0
-                record(phase: "offline", detail: "已连接校园网，但互联网路径不可用，等待网络恢复。")
-                return
+            let stillConnected: @Sendable () -> Bool = { [snapshot, cancellation] in
+                guard !cancellation.isCancelled() else { return false }
+                let current = snapshot.read()
+                return current.permissionAuthorized && selectNetwork(current.networks)?.key == key
             }
+            if shouldProbe {
+                if LoginService.hasInternetConnectivity(stillConnected: stillConnected) {
+                    state.attempt = 0
+                    record(phase: "online", detail: "互联网连接正常。")
+                    return
+                }
+                shouldProbe = false
+            }
+            guard stillConnected() else { continue }
 
             let config: AppConfig
             switch store.effectiveConfig() {
@@ -985,11 +1014,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             }
             state.attempt = state.attempt == UInt32.max ? .max : state.attempt + 1
 
-            let outcome = LoginService.login(config: config, ip: network.ip ?? "") { [snapshot, cancellation] in
-                guard !cancellation.isCancelled() else { return false }
-                let current = snapshot.read()
-                return current.permissionAuthorized && current.pathSatisfied && selectNetwork(current.networks)?.key == key
-            }
+            let outcome = LoginService.login(config: config, ip: network.ip ?? "", stillConnected: stillConnected)
             switch outcome.0 {
             case .online:
                 state.route = outcome.1
@@ -1048,7 +1073,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.csustautologin.path")
     private var updateCheckTimer: Timer?
-    private var pathSatisfied = false
+    private var connectivityTimer: Timer?
     private var started = false
     private var isCheckingForUpdate = false
     private var isInstallingUpdate = false
@@ -1096,13 +1121,15 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
         wifiMonitor.start()
-        pathMonitor.pathUpdateHandler = { [weak self] path in
-            let pathSatisfied = path.status == .satisfied
-            Task { @MainActor [weak self] in self?.handlePathUpdate(pathSatisfied) }
+        pathMonitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor [weak self] in self?.requestCheck() }
         }
         pathMonitor.start(queue: pathQueue)
         updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 3 * 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.checkForUpdates(silently: true) }
+        }
+        connectivityTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.requestCheck() }
         }
         requestLocationPermissionIfNeeded()
         refreshNetworks()
@@ -1120,6 +1147,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     func stop() {
         updateCheckTimer?.invalidate()
         updateCheckTimer = nil
+        connectivityTimer?.invalidate()
+        connectivityTimer = nil
         pathMonitor.cancel()
         wifiMonitor.stop()
         engine.stop()
@@ -1336,15 +1365,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         networks = wifiMonitor.networks()
         engineSnapshot.update(
             networks: networks,
-            permissionAuthorized: isLocationAuthorized,
-            pathSatisfied: pathSatisfied
+            permissionAuthorized: isLocationAuthorized
         )
-    }
-
-    private func handlePathUpdate(_ satisfied: Bool) {
-        pathSatisfied = satisfied
-        refreshNetworks()
-        engine.request()
     }
 
     private func requestNotificationPermission() {
@@ -1691,6 +1713,9 @@ enum SelfTest {
         precondition(parseResponse("dr1003({\"result\":1});") == .online)
         precondition(parseResponse("dr1003({\"msg\":\"密码错误\"});") == .credentials)
         precondition(parseResponse("dr1003({\"msg\":\"10.183.0.2 已经在线！\"});") == .online)
+        precondition(LoginService.isConnectivityEvidence(statusCode: 204, body: Data(), redirectLocation: nil))
+        precondition(!LoginService.isConnectivityEvidence(statusCode: 200, body: Data(), redirectLocation: nil))
+        precondition(!LoginService.isConnectivityEvidence(statusCode: 302, body: Data(), redirectLocation: "https://portal.example"))
         precondition(config.validationError() == nil)
         let encodedConfig = try! JSONEncoder().encode(config)
         precondition(String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
@@ -1717,7 +1742,7 @@ enum SelfTest {
               "body": "",
               "assets": [{
                 "name": "CampusAutoLogin.app.tar",
-                "browser_download_url": "https://github.com/notCorwin/campus-auto-network/releases/download/autobuild/CampusAutoLogin.app.tar",
+                "browser_download_url": "https://github.com/notCorwin/Csust-Network-Automation/releases/download/autobuild/CampusAutoLogin.app.tar",
                 "digest": "sha256:\(digest)"
               }]
             }
@@ -1846,28 +1871,10 @@ enum SelfTest {
             precondition(permissionWaiting.wait(timeout: .now() + 3) == .success)
             permissionEngine.stop()
         }
-        let offlineSnapshot = EngineSnapshot()
-        offlineSnapshot.update(
-            networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: nil, ip: nil)],
-            permissionAuthorized: true,
-            pathSatisfied: false
-        )
-        let offlineObserved = LockedAppState()
-        let offlineWaiting = DispatchSemaphore(value: 0)
-        let offlineEngine = AutoLoginEngine(store: store, snapshot: offlineSnapshot) { state, _ in
-            offlineObserved.set(state)
-            if state.phase == "offline" && !state.checking { offlineWaiting.signal() }
-        }
-        offlineEngine.start()
-        precondition(offlineWaiting.wait(timeout: .now() + 3) == .success)
-        precondition(offlineObserved.get().phase == "offline")
-        offlineEngine.stop()
-
         let snapshot = EngineSnapshot()
         snapshot.update(
             networks: [WiFiNetwork(interfaceName: "en0", ssid: "other", bssid: nil, ip: nil)],
-            permissionAuthorized: true,
-            pathSatisfied: true
+            permissionAuthorized: true
         )
         let observed = LockedAppState()
         let waiting = DispatchSemaphore(value: 0)

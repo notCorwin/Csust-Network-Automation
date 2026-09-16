@@ -157,7 +157,7 @@ final class AppUpdater: @unchecked Sendable {
     private static let bundleIdentifier = "com.nowaywastaken.csustautologin"
     private static let executableName = "CampusAutoLogin"
     private static let canonicalAssetURL = URL(
-        string: "https://github.com/notCorwin/campus-auto-network/releases/download/autobuild/CampusAutoLogin.app.tar"
+        string: "https://github.com/notCorwin/Csust-Network-Automation/releases/download/autobuild/CampusAutoLogin.app.tar"
     )!
     private static let maxAttempts = 3
     // ponytail: cap release metadata before parsing; raise only if the API contract grows.
@@ -183,7 +183,7 @@ final class AppUpdater: @unchecked Sendable {
     }
 
     static let releaseAPIURL = URL(
-        string: "https://api.github.com/repos/notCorwin/campus-auto-network/releases/tags/autobuild"
+        string: "https://api.github.com/repos/notCorwin/Csust-Network-Automation/releases/tags/autobuild"
     )!
     private let metadataSession: URLSession
     private let metadataDelegate: DownloadProgressDelegate
