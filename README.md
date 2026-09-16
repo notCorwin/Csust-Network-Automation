@@ -9,7 +9,7 @@
 - Wi‑Fi 和网络路径变化时立即检查；连接校园网期间每 5 秒请求一次 `https://www.google.com/generate_204`，收到空的 HTTP 204 响应才视为互联网可用。离开校园网后不发送连通性或认证请求。
 - 认证失败后立即重试，账号或密码被拒绝时暂停，等待修改配置或手动重试。
 - 认证时先尝试直连，再尝试 macOS 系统代理或 PAC；HTTPS 使用系统证书校验。
-- 菜单栏只显示 🛰️，提供状态、立即检查、诊断、设置、更新和退出。
+- 菜单栏使用 SF Symbols 的 `network` 图标；未连接时与 `network.slash` 交替显示。菜单提供状态、立即检查、诊断、设置、更新和退出。
 - 自动注册登录时启动，每 3 分钟检查一次 GitHub `autobuild` Release；有更新时在菜单中显示提交哈希和发布时间，点击更新项并确认后安装。安装前校验 SHA-256 摘要、归档内容和 App 身份。
 
 账号、密码和运行状态保存在 **UserDefaults**，不使用 Keychain。请在自己信任的 macOS 用户账户中使用。
@@ -32,7 +32,7 @@ cd Csust-Network-Automation
 bash install.sh
 ```
 
-安装器会构建和测试 App，将其放入 `~/Applications/NetworkAuto.app`，启动并注册登录时自动启动。首次打开时，在菜单栏的 🛰️ → **设置…** 中保存校园网账号和密码，然后按系统提示允许定位权限。连接 `CSUST-Student` 后即可自动检查和认证；需要主动检查时选择 **立即检查**，需要查看认证服务器连接情况时选择 **诊断**。
+安装器会构建和测试 App，将其放入 `~/Applications/NetworkAuto.app`，启动并注册登录时自动启动。首次打开时，在菜单栏的网络图标 → **设置…** 中保存校园网账号和密码，然后按系统提示允许定位权限。连接 `CSUST-Student` 后即可自动检查和认证；需要主动检查时选择 **立即检查**，需要查看认证服务器连接情况时选择 **诊断**。
 
 从旧版 `CampusAutoLogin.app` 升级时，请重新运行安装脚本。安装成功后，它会移除 `~/Applications` 或 `/Applications` 中同一 Bundle ID 的旧 App；Bundle ID 和用户数据位置保持不变，以沿用已保存的账号密码及登录启动配置。
 
@@ -59,7 +59,7 @@ codesign --verify --deep --strict target/NetworkAuto.app
 
 `build.sh` 包含 Swift 6 严格并发类型检查、编译、App 内置 self-test 和安装事务 self-test。主要逻辑位于 [NetworkAutoApp.swift](NetworkAutoApp.swift)，更新器位于 [AppUpdater.swift](AppUpdater.swift)，构建和安装脚本分别是 [build.sh](build.sh) 与 [install.sh](install.sh)。推送后，[GitHub Actions](.github/workflows/release.yml) 会构建并更新 `autobuild` Release。
 
-App 图标来自 [原始 PNG](Assets/NetworkAutoIcon.png)，构建时使用 [macOS 图标文件](Assets/NetworkAuto.icns)；菜单栏仍显示 🛰️。
+App 图标来自 [原始 PNG](Assets/NetworkAutoIcon.png)，构建时使用 [macOS 图标文件](Assets/NetworkAuto.icns)；菜单栏显示 SF Symbols 网络图标。
 
 ## 获取帮助与贡献
 

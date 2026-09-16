@@ -1356,10 +1356,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         return state.detail.isEmpty ? "尚无检查记录" : state.detail
     }
 
-    var statusEmoji: String {
-        "🛰️"
-    }
-
     private func apply(state: AppState, shouldNotify: Bool) {
         self.state = state
         if manualCheckRequested && !state.checking {
@@ -1596,10 +1592,27 @@ private struct NativeSettingsButton: View {
 
 struct MenuBarLabel: View {
     @ObservedObject var model: AppModel
+    @State private var alternate = false
 
     var body: some View {
-        Text(model.statusEmoji)
-            .accessibilityLabel("Csust-Network-Automation")
+        Group {
+            if #available(macOS 15.0, *) {
+                symbol.contentTransition(.symbolEffect(.replace.magic(fallback: .replace.wholeSymbol)))
+            } else if #available(macOS 14.0, *) {
+                symbol.contentTransition(.symbolEffect(.replace.wholeSymbol))
+            } else {
+                symbol
+            }
+        }
+        .onReceive(Timer.publish(every: 0.8, on: .main, in: .common).autoconnect()) { _ in
+            if model.state.phase != "online" { alternate.toggle() }
+        }
+        .accessibilityLabel(model.state.phase == "online" ? "校园网已连接" : "校园网未连接")
+    }
+
+    private var symbol: some View {
+        Image(systemName: model.state.phase == "online" || !alternate ? "network" : "network.slash")
+            .symbolRenderingMode(.hierarchical)
     }
 }
 
