@@ -1,67 +1,64 @@
 # 校园网自动登录
 
-一个面向 macOS 的原生 Swift 菜单栏 App：连接到指定校园 Wi‑Fi 后自动完成认证，并在校园网登录状态失效时重新登录。
+[![macOS 构建](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml)
+
+一个适用于 macOS 13+ 的原生 Swift 菜单栏 App。连接 `CSUST-Student` 后，它检查互联网连通性，并在校园网认证失效时自动登录 `login.csust.edu.cn`。
 
 ## 功能
 
-- 支持 macOS 13+，仅把 SSID 精确匹配 CSUST-Student 作为校园网证据。
-- 使用 CoreWLAN Wi‑Fi 事件与 NWPathMonitor 网络路径事件即时检查；在校园网内每 5 秒请求一次 https://www.google.com/generate_204，只有收到空响应的 HTTP 204 才视为互联网可用。
-- 认证失败会在收到结果后立即重试；检测到账号或密码错误时暂停自动尝试。
-- 先直连认证地址，失败后使用 macOS 系统代理或 PAC，兼容有无代理的环境。
-- 使用系统 TLS 校验证书，认证地址固定为 https://login.csust.edu.cn:802/eportal/portal/login。
-- 账号、密码和状态使用 UserDefaults 保存，不使用 Keychain。
-- 登录时自动启动，菜单栏提供立即检查、诊断、设置、更新和退出。
-- 每 3 分钟检查 GitHub Autobuild Release，并校验归档、Bundle ID、可执行文件和 SHA-256 后再替换。
+- Wi‑Fi 和网络路径变化时立即检查；连接校园网期间每 5 秒请求一次 `https://www.google.com/generate_204`，收到空的 HTTP 204 响应才视为互联网可用。离开校园网后不发送连通性或认证请求。
+- 认证失败后立即重试，账号或密码被拒绝时暂停，等待修改配置或手动重试。
+- 认证时先尝试直连，再尝试 macOS 系统代理或 PAC；HTTPS 使用系统证书校验。
+- 菜单栏只显示 🛰️，提供状态、立即检查、诊断、设置、更新和退出。
+- 自动注册登录时启动，每 3 分钟检查一次 GitHub `autobuild` Release；发现新提交后自动安装。安装前检查归档内容、App 身份和可用的 SHA-256 摘要。
+
+账号、密码和运行状态保存在 **UserDefaults**，不使用 Keychain。请在自己信任的 macOS 用户账户中使用。
 
 ## 系统要求
 
-- macOS 13 或更高版本。
-- Apple Silicon Mac；当前构建脚本的目标架构为 arm64。
-- Xcode 26，或包含 macOS 15 SDK 的 Command Line Tools。
+- macOS 13 或更新版本，Apple Silicon Mac（构建脚本目前只生成 arm64 App）。
+- 从源码安装需要 Xcode 26，或提供 macOS 15 SDK 的 Command Line Tools，以及 `git`。
+- 需要允许 App 使用定位服务以读取当前 Wi‑Fi 名称；校园网 SSID 必须精确为 `CSUST-Student`。
 
-项目不引入第三方 Swift 依赖。
+项目没有第三方 Swift 依赖。
 
 ## 安装与使用
 
-在项目根目录执行：
+从源码安装并启动：
 
-~~~sh
+```sh
+git clone https://github.com/notCorwin/Csust-Network-Automation.git
+cd Csust-Network-Automation
 bash install.sh
-~~~
+```
 
-安装器会构建并校验 App，将它安装到 $HOME/Applications/CampusAutoLogin.app，启动 App 并注册登录时自动启动。首次运行需要在设置中填写校园网账号和密码，并允许网络与无线定位权限。
+安装器会构建和测试 App，将其放入 `~/Applications/CampusAutoLogin.app`，启动并注册登录时自动启动。首次打开时，在菜单栏的 🛰️ → **设置…** 中保存校园网账号和密码，然后按系统提示允许定位权限。连接 `CSUST-Student` 后即可自动检查和认证；需要主动检查时选择 **立即检查**，需要查看认证服务器连接情况时选择 **诊断**。
 
-如果没有出现权限提示，可在菜单栏选择“申请定位权限”，或打开“系统设置 → 隐私与安全性 → 定位服务 → 系统服务 → 网络与无线”。
+如果系统没有显示定位权限提示，可在菜单栏选择 **申请定位权限** 或 **打开定位设置**。在“系统设置 → 隐私与安全性 → 定位服务”中检查 App 及“系统服务 → 网络与无线”的权限。没有可读取的 SSID 时，App 无法判断是否在校园网。
 
-卸载 App 和旧的登录启动配置：
+卸载 App 和旧版登录启动配置：
 
-~~~sh
+```sh
 bash install.sh uninstall
-~~~
+```
 
-卸载不会删除已保存的配置和日志。
+卸载会保留 UserDefaults 中的配置和运行状态，以及 `~/Library/Logs/csust-auto-login/` 下的日志。
 
 ## 开发与验证
 
-构建、运行内置 self-test，并检查安装事务：
+在仓库根目录运行：
 
-~~~sh
+```sh
 bash build.sh
-bash install.sh self-test
-~~~
-
-基础脚本与 App 包检查：
-
-~~~sh
 bash -n build.sh install.sh
 plutil -lint Info.plist
 codesign --verify --deep --strict target/CampusAutoLogin.app
-~~~
+```
 
-主要实现位于 [CampusAutoLoginApp.swift](CampusAutoLoginApp.swift)，更新逻辑位于 [AppUpdater.swift](AppUpdater.swift)，构建和安装入口分别是 [build.sh](build.sh) 与 [install.sh](install.sh)。
+`build.sh` 包含 Swift 6 严格并发类型检查、编译、App 内置 self-test 和安装事务 self-test。主要逻辑位于 [CampusAutoLoginApp.swift](CampusAutoLoginApp.swift)，更新器位于 [AppUpdater.swift](AppUpdater.swift)，构建和安装脚本分别是 [build.sh](build.sh) 与 [install.sh](install.sh)。推送后，[GitHub Actions](.github/workflows/release.yml) 会构建并更新 `autobuild` Release。
 
 ## 获取帮助与贡献
 
-请在 [Issue 列表](https://github.com/notCorwin/Csust-Network-Automation/issues) 中附上 macOS 版本、机器架构、复现步骤和诊断信息。提交修改前请运行上述验证命令，并保持改动聚焦；不要提交账号、密码、日志中的敏感信息或构建产物。
+遇到问题请到 [Issues](https://github.com/notCorwin/Csust-Network-Automation/issues) 提交 macOS 版本、机器架构、复现步骤和菜单栏诊断结果。分享诊断或日志前，请先移除账号、密码及不愿公开的网络信息。
 
-维护者：[@notCorwin](https://github.com/notCorwin)。
+欢迎提交聚焦的修改；提交前运行上述验证命令。项目由 [@notCorwin](https://github.com/notCorwin) 维护。

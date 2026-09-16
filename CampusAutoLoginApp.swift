@@ -1503,7 +1503,7 @@ struct SettingsView: View {
             }
             Section("连接方式") {
                 Text("自动适配 macOS 系统代理/PAC：先直连，失败后使用系统代理。")
-                Text("认证地址请求成功且系统网络路径可用即视为登录成功，不发送 204 探测请求。")
+                Text("在校园网内每 5 秒检查互联网连通性；未收到 204 响应时自动尝试认证。")
                     .fixedSize(horizontal: false, vertical: true)
             }
             Section {
