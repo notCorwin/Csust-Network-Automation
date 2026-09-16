@@ -10,14 +10,14 @@ import ServiceManagement
 import SwiftUI
 import UserNotifications
 
-private let appDisplayName = "校园网自动登录"
+private let appDisplayName = "Csust-Network-Automation"
 private let campusSSID = "CSUST-Student"
 private let campusLoginURL = URL(string: "https://login.csust.edu.cn:802/eportal/portal/login")!
 private let connectivityURL = URL(string: "https://www.google.com/generate_204")!
 private let loginRequestTimeoutSecs: TimeInterval = 15
 private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
-private let settingsWindowIdentifier = "com.nowaywastaken.csustautologin.settings"
+private let settingsWindowIdentifier = "com.nowaywastaken.networkauto.settings"
 
 struct AppError: Error, LocalizedError, Sendable, Equatable {
     let message: String
@@ -100,7 +100,7 @@ enum AppInstanceLockError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .alreadyRunning: return "校园网自动登录已经在运行。"
+        case .alreadyRunning: return "Csust-Network-Automation 已经在运行。"
         case .openFailed(let message): return "无法打开运行锁：\(message)"
         case .lockFailed(let message): return "无法取得运行锁：\(message)"
         }
@@ -868,7 +868,7 @@ final class AutoLoginEngine: @unchecked Sendable {
     private let logger: LogStore
     private let snapshot: EngineSnapshot
     private let cancellation = CancellationSignal()
-    private let queue = DispatchQueue(label: "com.nowaywastaken.csustautologin.engine", qos: .utility)
+    private let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.engine", qos: .utility)
     private var state: AppState
     private var running = false
     private var pending = false
@@ -1091,7 +1091,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let wifiMonitor = WiFiMonitor()
     private let engineSnapshot = EngineSnapshot()
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
-    private let pathQueue = DispatchQueue(label: "com.nowaywastaken.csustautologin.path")
+    private let pathQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.path")
     private var updateCheckTimer: Timer?
     private var updateDisplayTimer: Timer?
     private var lastUpdatePublishedAt: Date?
@@ -1315,7 +1315,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     private func presentUpdate(_ update: AppUpdate) {
         let alert = NSAlert()
-        alert.messageText = "发现校园网自动登录新版本"
+        alert.messageText = "发现 Csust-Network-Automation 新版本"
         let revision = update.revision == "unknown"
             ? ""
             : "\n构建提交：\(update.revision.prefix(7))"
@@ -1599,7 +1599,7 @@ struct MenuBarLabel: View {
 
     var body: some View {
         Text(model.statusEmoji)
-            .accessibilityLabel("校园网自动登录")
+            .accessibilityLabel("Csust-Network-Automation")
     }
 }
 
@@ -1629,13 +1629,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try ensurePrivateDirectory(paths.data)
             instanceLock = try AppInstanceLock(path: paths.data.appendingPathComponent("run.lock"))
         } catch AppInstanceLockError.alreadyRunning {
-            NSLog("校园网自动登录已在运行，退出重复实例。")
-            showStartupError("校园网自动登录已经在运行。请使用菜单栏中的现有图标。")
+            NSLog("Csust-Network-Automation 已在运行，退出重复实例。")
+            showStartupError("Csust-Network-Automation 已经在运行。请使用菜单栏中的现有图标。")
             NSApp.terminate(nil)
             return
         } catch {
-            NSLog("无法取得校园网自动登录运行锁：%@", error.localizedDescription)
-            showStartupError("无法启动校园网自动登录：\(error.localizedDescription)")
+            NSLog("无法取得 Csust-Network-Automation 运行锁：%@", error.localizedDescription)
+            showStartupError("无法启动 Csust-Network-Automation：\(error.localizedDescription)")
             NSApp.terminate(nil)
             return
         }
@@ -1659,7 +1659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func signalReadinessIfRequested() {
-        guard let path = ProcessInfo.processInfo.environment["CAMPUS_AUTO_LOGIN_READY_FILE"],
+        guard let path = ProcessInfo.processInfo.environment["NETWORK_AUTO_READY_FILE"],
               !path.isEmpty else {
             return
         }
@@ -1748,7 +1748,7 @@ enum SelfTest {
         engineCancellationAndMutex()
         httpLogin(proxy: false)
         httpLogin(proxy: true)
-        print("CampusAutoLogin self-test passed")
+        print("NetworkAuto self-test passed")
     }
 
     private static func updateParsing() {
@@ -1762,8 +1762,8 @@ enum SelfTest {
               "target_commitish": "\(revision)",
               "body": "",
               "assets": [{
-                "name": "CampusAutoLogin.app.tar",
-                "browser_download_url": "https://github.com/notCorwin/Csust-Network-Automation/releases/download/autobuild/CampusAutoLogin.app.tar",
+                "name": "NetworkAuto.app.tar",
+                "browser_download_url": "https://github.com/notCorwin/Csust-Network-Automation/releases/download/autobuild/NetworkAuto.app.tar",
                 "digest": "sha256:\(digest)"
               }]
             }
@@ -1772,11 +1772,11 @@ enum SelfTest {
         precondition(AppUpdater.revision(in: "commit \(revision)") == revision)
         precondition(
             AppUpdater.archiveAppRoot(
-                from: "CampusAutoLogin.app/Contents/MacOS/CampusAutoLogin"
-            ) == "CampusAutoLogin.app"
+                from: "NetworkAuto.app/Contents/MacOS/NetworkAuto"
+            ) == "NetworkAuto.app"
         )
         precondition(
-            AppUpdater.archiveAppRoot(from: "../CampusAutoLogin.app/Contents") == nil
+            AppUpdater.archiveAppRoot(from: "../NetworkAuto.app/Contents") == nil
         )
         precondition(
             AppUpdater.archiveContainsUnsafeEntry(
@@ -1920,7 +1920,7 @@ enum SelfTest {
     }
 
     private static func httpLogin(proxy: Bool) {
-        let queue = DispatchQueue(label: "com.nowaywastaken.csustautologin.self-test-server")
+        let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.self-test-server")
         let listener = try! NWListener(using: .tcp, on: .any)
         let ready = DispatchSemaphore(value: 0)
         let requestDone = DispatchSemaphore(value: 0)
@@ -1975,7 +1975,7 @@ enum SelfTest {
 }
 
 @main
-struct CampusAutoLoginApp: App {
+struct NetworkAutoApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {

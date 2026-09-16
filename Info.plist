@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>校园网自动登录</string>
+	<string>Csust-Network-Automation</string>
 	<key>CFBundleExecutable</key>
-	<string>CampusAutoLogin</string>
+	<string>NetworkAuto</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.nowaywastaken.csustautologin</string>
 	<key>CFBundleName</key>
-	<string>CampusAutoLogin</string>
+	<string>NetworkAuto</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

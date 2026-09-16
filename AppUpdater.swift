@@ -152,12 +152,12 @@ final class AppUpdater: @unchecked Sendable {
     typealias InstallCompletion = @MainActor @Sendable (Result<Void, AppUpdateError>) -> Void
     typealias Relauncher = @Sendable (URL, URL) throws -> Void
 
-    private static let appName = "CampusAutoLogin"
-    private static let assetName = "CampusAutoLogin.app.tar"
+    private static let appName = "NetworkAuto"
+    private static let assetName = "NetworkAuto.app.tar"
     private static let bundleIdentifier = "com.nowaywastaken.csustautologin"
-    private static let executableName = "CampusAutoLogin"
+    private static let executableName = "NetworkAuto"
     private static let canonicalAssetURL = URL(
-        string: "https://github.com/notCorwin/Csust-Network-Automation/releases/download/autobuild/CampusAutoLogin.app.tar"
+        string: "https://github.com/notCorwin/Csust-Network-Automation/releases/download/autobuild/NetworkAuto.app.tar"
     )!
     private static let maxAttempts = 3
     // ponytail: cap release metadata before parsing; raise only if the API contract grows.
@@ -276,7 +276,7 @@ final class AppUpdater: @unchecked Sendable {
         request.timeoutInterval = 30
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        request.setValue("CampusAutoLogin", forHTTPHeaderField: "User-Agent")
+        request.setValue("NetworkAuto", forHTTPHeaderField: "User-Agent")
         let task = metadataSession.downloadTask(with: request) { [weak self] location, response, error in
             guard let self else { return }
             guard self.isCurrentOperation(generation) else { return }
@@ -399,7 +399,7 @@ final class AppUpdater: @unchecked Sendable {
         request.timeoutInterval = 5 * 60
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        request.setValue("CampusAutoLogin", forHTTPHeaderField: "User-Agent")
+        request.setValue("NetworkAuto", forHTTPHeaderField: "User-Agent")
         let task = downloadSession.downloadTask(with: request) { [weak self] location, response, error in
             guard let self else { return }
             guard self.isCurrentOperation(generation) else { return }
@@ -811,7 +811,7 @@ final class AppUpdater: @unchecked Sendable {
     func install(downloadedFile: URL, expectedRevision: String) throws {
         let fileManager = FileManager.default
         let temporaryDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("CampusAutoLogin-update-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("NetworkAuto-update-\(UUID().uuidString)", isDirectory: true)
         defer { try? fileManager.removeItem(at: temporaryDirectory) }
 
         let downloadedFileSize = (try? fileManager.attributesOfItem(atPath: downloadedFile.path))?[.size]
@@ -858,9 +858,9 @@ final class AppUpdater: @unchecked Sendable {
             throw AppUpdateError.notPackaged
         }
         let stagedApp = currentApp.deletingLastPathComponent()
-            .appendingPathComponent(".CampusAutoLogin-update-\(UUID().uuidString).app", isDirectory: true)
+            .appendingPathComponent(".NetworkAuto-update-\(UUID().uuidString).app", isDirectory: true)
         let backupApp = currentApp.deletingLastPathComponent()
-            .appendingPathComponent(".CampusAutoLogin-backup-\(UUID().uuidString).app", isDirectory: true)
+            .appendingPathComponent(".NetworkAuto-backup-\(UUID().uuidString).app", isDirectory: true)
         var backupCreated = false
         do {
             try fileManager.copyItem(at: currentApp, to: backupApp)
@@ -990,7 +990,7 @@ final class AppUpdater: @unchecked Sendable {
     }
 
     private static let defaultRelauncherScript = #"""
-ready_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/campus-auto-login-ready.XXXXXX") || exit 1
+ready_dir=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/network-auto-ready.XXXXXX") || exit 1
 ready_file="$ready_dir/ready"
 trap 'rm -rf "$ready_dir"' EXIT
 old_pid="$2"
@@ -1006,7 +1006,7 @@ done
 if kill -0 "$old_pid" 2>/dev/null; then
     exit 1
 fi
-CAMPUS_AUTO_LOGIN_READY_FILE="$ready_file" "$1/Contents/MacOS/CampusAutoLogin" >/dev/null 2>&1 &
+NETWORK_AUTO_READY_FILE="$ready_file" "$1/Contents/MacOS/NetworkAuto" >/dev/null 2>&1 &
 new_pid=$!
 attempt=0
 while [ "$attempt" -lt 50 ]; do
@@ -1037,7 +1037,7 @@ rm -rf "$1"
 if [ -d "$3" ]; then
     mv "$3" "$1"
     restored_ready="$ready_dir/restored"
-    CAMPUS_AUTO_LOGIN_READY_FILE="$restored_ready" "$1/Contents/MacOS/CampusAutoLogin" >/dev/null 2>&1 &
+    NETWORK_AUTO_READY_FILE="$restored_ready" "$1/Contents/MacOS/NetworkAuto" >/dev/null 2>&1 &
 fi
 exit 1
 """#
@@ -1048,7 +1048,7 @@ exit 1
         process.arguments = [
             "-c",
             defaultRelauncherScript,
-            "CampusAutoLogin updater",
+            "NetworkAuto updater",
             appURL.path,
             String(ProcessInfo.processInfo.processIdentifier),
             backupURL.path

@@ -30,15 +30,15 @@ jobs:
 
       - name: Package app asset
         run: |
-          tar -cf CampusAutoLogin.app.tar -C target CampusAutoLogin.app
+          tar -cf NetworkAuto.app.tar -C target NetworkAuto.app
 
       - name: Verify package
         run: |
-          test -f "target/CampusAutoLogin.app/Contents/MacOS/CampusAutoLogin"
-          test -x "target/CampusAutoLogin.app/Contents/MacOS/CampusAutoLogin"
-          test -f "target/CampusAutoLogin.app/Contents/Info.plist"
-          test -f CampusAutoLogin.app.tar
-          tar -tf CampusAutoLogin.app.tar | grep -qx "CampusAutoLogin.app/Contents/MacOS/CampusAutoLogin"
+          test -f "target/NetworkAuto.app/Contents/MacOS/NetworkAuto"
+          test -x "target/NetworkAuto.app/Contents/MacOS/NetworkAuto"
+          test -f "target/NetworkAuto.app/Contents/Info.plist"
+          test -f NetworkAuto.app.tar
+          tar -tf NetworkAuto.app.tar | grep -qx "NetworkAuto.app/Contents/MacOS/NetworkAuto"
 
       - name: Replace autobuild Release
         env:
@@ -61,10 +61,10 @@ jobs:
           tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
           [[ "$tag_sha" == "$COMMIT_SHA" ]]
 
-          curl --fail --silent --show-error -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=CampusAutoLogin.app.tar&label=CampusAutoLogin.app" -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/x-tar" --data-binary @CampusAutoLogin.app.tar
+          curl --fail --silent --show-error -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=NetworkAuto.app.tar&label=NetworkAuto.app" -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/x-tar" --data-binary @NetworkAuto.app.tar
 
-          asset_count="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '[.[] | select(.name == "CampusAutoLogin.app.tar" and .label == "CampusAutoLogin.app")] | length')"
+          asset_count="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '[.[] | select(.name == "NetworkAuto.app.tar" and .label == "NetworkAuto.app")] | length')"
           [[ "$asset_count" == "1" ]]
 
-          asset_digest="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '[.[] | select(.name == "CampusAutoLogin.app.tar" and .label == "CampusAutoLogin.app")] | .[0].digest')"
+          asset_digest="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" --jq '[.[] | select(.name == "NetworkAuto.app.tar" and .label == "NetworkAuto.app")] | .[0].digest')"
           [[ "$asset_digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]

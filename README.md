@@ -1,8 +1,8 @@
-# 校园网自动登录
+# Csust-Network-Automation
 
 [![macOS 构建](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml)
 
-一个适用于 macOS 13+ 的原生 Swift 菜单栏 App。连接 `CSUST-Student` 后，它检查互联网连通性，并在校园网认证失效时自动登录 `login.csust.edu.cn`。
+一个适用于 macOS 13+ 的原生 Swift 菜单栏 App，安装包为 `NetworkAuto.app`。连接 `CSUST-Student` 后，它检查互联网连通性，并在校园网认证失效时自动登录 `login.csust.edu.cn`。
 
 ## 功能
 
@@ -32,7 +32,9 @@ cd Csust-Network-Automation
 bash install.sh
 ```
 
-安装器会构建和测试 App，将其放入 `~/Applications/CampusAutoLogin.app`，启动并注册登录时自动启动。首次打开时，在菜单栏的 🛰️ → **设置…** 中保存校园网账号和密码，然后按系统提示允许定位权限。连接 `CSUST-Student` 后即可自动检查和认证；需要主动检查时选择 **立即检查**，需要查看认证服务器连接情况时选择 **诊断**。
+安装器会构建和测试 App，将其放入 `~/Applications/NetworkAuto.app`，启动并注册登录时自动启动。首次打开时，在菜单栏的 🛰️ → **设置…** 中保存校园网账号和密码，然后按系统提示允许定位权限。连接 `CSUST-Student` 后即可自动检查和认证；需要主动检查时选择 **立即检查**，需要查看认证服务器连接情况时选择 **诊断**。
+
+从旧版 `CampusAutoLogin.app` 升级时，请重新运行安装脚本。安装成功后，它会移除 `~/Applications` 或 `/Applications` 中同一 Bundle ID 的旧 App；Bundle ID 和用户数据位置保持不变，以沿用已保存的账号密码及登录启动配置。
 
 如果系统没有显示定位权限提示，可在菜单栏选择 **申请定位权限** 或 **打开定位设置**。在“系统设置 → 隐私与安全性 → 定位服务”中检查 App 及“系统服务 → 网络与无线”的权限。没有可读取的 SSID 时，App 无法判断是否在校园网。
 
@@ -52,10 +54,10 @@ bash install.sh uninstall
 bash build.sh
 bash -n build.sh install.sh
 plutil -lint Info.plist
-codesign --verify --deep --strict target/CampusAutoLogin.app
+codesign --verify --deep --strict target/NetworkAuto.app
 ```
 
-`build.sh` 包含 Swift 6 严格并发类型检查、编译、App 内置 self-test 和安装事务 self-test。主要逻辑位于 [CampusAutoLoginApp.swift](CampusAutoLoginApp.swift)，更新器位于 [AppUpdater.swift](AppUpdater.swift)，构建和安装脚本分别是 [build.sh](build.sh) 与 [install.sh](install.sh)。推送后，[GitHub Actions](.github/workflows/release.yml) 会构建并更新 `autobuild` Release。
+`build.sh` 包含 Swift 6 严格并发类型检查、编译、App 内置 self-test 和安装事务 self-test。主要逻辑位于 [NetworkAutoApp.swift](NetworkAutoApp.swift)，更新器位于 [AppUpdater.swift](AppUpdater.swift)，构建和安装脚本分别是 [build.sh](build.sh) 与 [install.sh](install.sh)。推送后，[GitHub Actions](.github/workflows/release.yml) 会构建并更新 `autobuild` Release。
 
 ## 获取帮助与贡献
 
