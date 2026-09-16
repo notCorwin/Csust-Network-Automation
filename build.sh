@@ -11,7 +11,7 @@ echo "🔨 正在编译 Csust-Network-Automation App..."
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typecheck \
-	-target arm64-apple-macosx13.0 \
+	-target arm64-apple-macosx15.0 \
 	-framework AppKit \
   -framework SwiftUI \
   -framework CoreLocation \
@@ -22,7 +22,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typechec
   -framework UserNotifications \
   NetworkAutoApp.swift AppUpdater.swift
 swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
-	-target arm64-apple-macosx13.0 \
+	-target arm64-apple-macosx15.0 \
 	-framework AppKit \
   -framework SwiftUI \
   -framework CoreLocation \

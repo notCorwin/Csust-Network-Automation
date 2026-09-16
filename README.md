@@ -2,7 +2,7 @@
 
 [![macOS 构建](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml)
 
-一个适用于 macOS 13+ 的原生 Swift 菜单栏 App，安装包为 `NetworkAuto.app`。连接 `CSUST-Student` 后，它检查互联网连通性，并在校园网认证失效时自动登录 `login.csust.edu.cn`。
+一个适用于 macOS 15+ 的原生 Swift 菜单栏 App，安装包为 `NetworkAuto.app`。连接 `CSUST-Student` 后，它检查互联网连通性，并在校园网认证失效时自动登录 `login.csust.edu.cn`。
 
 ## 功能
 
@@ -16,7 +16,7 @@
 
 ## 系统要求
 
-- macOS 13 或更新版本，Apple Silicon Mac（构建脚本目前只生成 arm64 App）。
+- macOS 15 或更新版本，Apple Silicon Mac（构建脚本目前只生成 arm64 App）。
 - 从源码安装需要 Xcode 26，或提供 macOS 15 SDK 的 Command Line Tools，以及 `git`。
 - 需要允许 App 使用定位服务以读取当前 Wi‑Fi 名称；校园网 SSID 必须精确为 `CSUST-Student`。
 

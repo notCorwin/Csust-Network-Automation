@@ -8,7 +8,7 @@
    1. 每隔 5s 轮询一次 https://www.google.com/generate_204 作为连通证据
 
 5. 自动兼容机器的代理环境，在有无代理的情况下均能成功登录（除非是本机网络设置问题）。
-6. 纯 Swift App，支持 macOS 13+。
+6. 纯 Swift App，支持 macOS 15+。
 7. 尽可能避免中间人/恶意双胞胎攻击的风险，同时保证能够自动登录。
 8. 所有配置均使用 UserDefaults，完全不使用 Keychain。
 9. 通过 GitHub Releases 自动更新 App 的最新提交。
@@ -19,7 +19,13 @@
 
 ## 菜单栏组件 显示逻辑
 
-1. 只显示：🛰️，不使用 SF Symbols。
+1. 使用 SF Symbols Network 作为菜单栏图标。
+   1. 已连接：`network`
+   2. 未连接：`network` - `network.slash` 连续重复替换
+      1. 渲染模式：分层
+      2. 动画效果：整个符号
+      3. 魔术替换
+
 
 ## 切换到校园网的证据
 

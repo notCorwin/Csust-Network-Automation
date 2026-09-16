@@ -1473,11 +1473,7 @@ struct MenuContent: View {
         Divider()
         Button("立即检查") { model.checkNow() }
         Button("诊断") { model.runDoctor() }
-        if #available(macOS 14.0, *) {
-            NativeSettingsButton(model: model)
-        } else {
-            Button("设置…") { model.openSettingsWindow() }
-        }
+        NativeSettingsButton(model: model)
         if model.permissionStatus != .authorized {
             Button("申请定位权限") { model.requestLocationPermissionIfNeeded() }
             Button("打开定位设置") { model.openLocationSettings() }
@@ -1575,7 +1571,6 @@ private final class SettingsWindowProbe: NSView {
     }
 }
 
-@available(macOS 14.0, *)
 private struct NativeSettingsButton: View {
     @Environment(\.openSettings) private var openSettings
     @ObservedObject var model: AppModel
@@ -1595,25 +1590,17 @@ struct MenuBarLabel: View {
     @State private var alternate = false
 
     var body: some View {
-        Group {
-            if #available(macOS 15.0, *) {
-                symbol.contentTransition(.symbolEffect(.replace.magic(fallback: .replace.wholeSymbol)))
-            } else if #available(macOS 14.0, *) {
-                symbol.contentTransition(.symbolEffect(.replace.wholeSymbol))
-            } else {
-                symbol
-            }
-        }
+        Image(systemName: model.state.phase == "online" || !alternate ? "network" : "network.slash")
+        .symbolRenderingMode(.hierarchical)
+        .contentTransition(.symbolEffect(.replace.magic(fallback: .replace.wholeSymbol)))
+        .animation(.easeInOut(duration: 0.5), value: alternate)
+        .animation(.easeInOut(duration: 0.5), value: model.state.phase)
         .onReceive(Timer.publish(every: 0.8, on: .main, in: .common).autoconnect()) { _ in
             if model.state.phase != "online" { alternate.toggle() }
         }
         .accessibilityLabel(model.state.phase == "online" ? "校园网已连接" : "校园网未连接")
     }
 
-    private var symbol: some View {
-        Image(systemName: model.state.phase == "online" || !alternate ? "network" : "network.slash")
-            .symbolRenderingMode(.hierarchical)
-    }
 }
 
 @MainActor
