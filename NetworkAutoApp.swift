@@ -1221,7 +1221,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             }
             return
         }
-        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.locationManager.requestWhenInUseAuthorization()
@@ -1427,6 +1426,11 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         settingsWindowOpening = true
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.settingsWindowOpening else { return }
+            self.settingsWindowOpening = false
+            self.restoreBackgroundActivationIfNeeded()
+        }
     }
 
     func openSettingsWindow() {
