@@ -7,6 +7,7 @@ import Darwin
 import Foundation
 import Network
 import ServiceManagement
+import Symbols
 import SwiftUI
 import UserNotifications
 
@@ -1456,44 +1457,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 }
 
-struct MenuContent: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        Text(model.statusText)
-            .lineLimit(3)
-        if !model.state.network.isEmpty {
-            Text(model.state.network)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        if !model.diagnosticText.isEmpty {
-            Text(model.diagnosticText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(6)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        Divider()
-        Button("立即检查") { model.checkNow() }
-        Button("诊断") { model.runDoctor() }
-        NativeSettingsButton(model: model)
-        if model.permissionStatus != .authorized {
-            Button("申请定位权限") { model.requestLocationPermissionIfNeeded() }
-            Button("打开定位设置") { model.openLocationSettings() }
-        }
-        Divider()
-        Text("启动：\(model.launchStatus)")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        Divider()
-        Button(model.updateMenuTitle) { model.checkForUpdatesNow() }
-            .disabled(!model.updateActionEnabled)
-        Divider()
-        Button("退出") { model.quit() }
-    }
-}
-
 struct SettingsView: View {
     @ObservedObject var model: AppModel
     @State private var draft: AppConfig
@@ -1575,41 +1538,124 @@ private final class SettingsWindowProbe: NSView {
     }
 }
 
-private struct NativeSettingsButton: View {
-    @Environment(\.openSettings) private var openSettings
-    @ObservedObject var model: AppModel
+@MainActor
+private final class StatusBarController: NSObject, NSMenuDelegate {
+    private let model: AppModel
+    private let item = NSStatusBar.system.statusItem(withLength: 28)
+    private let icon = NSImageView(frame: .zero)
+    private let menu = NSMenu()
+    private var stateSubscription: AnyCancellable?
+    private var timer: Timer?
+    private var phase: String
+    private var alternate = false
+    private var symbolName = "network"
 
-    var body: some View {
-        Button("设置…") {
-            model.prepareSettingsWindow()
-            DispatchQueue.main.async {
-                openSettings()
-            }
+    init(model: AppModel) {
+        self.model = model
+        phase = model.state.phase
+        super.init()
+        guard let button = item.button else { return }
+        button.image = nil
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        button.addSubview(icon)
+        NSLayoutConstraint.activate([
+            icon.centerXAnchor.constraint(equalTo: button.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 20),
+            icon.heightAnchor.constraint(equalToConstant: 20),
+        ])
+        icon.image = symbol("network")
+        menu.delegate = self
+        item.menu = menu
+        updateAccessibility()
+        stateSubscription = model.$state.map(\.phase).removeDuplicates().sink { [weak self] phase in
+            self?.phase = phase
+            self?.alternate = false
+            self?.showSymbol("network")
+            self?.updateAccessibility()
         }
-    }
-}
-
-struct MenuBarLabel: View {
-    @ObservedObject var model: AppModel
-    @State private var alternate = false
-
-    var body: some View {
-        Image(systemName: model.state.phase == "online" || !alternate ? "network" : "network.slash")
-        .symbolRenderingMode(.hierarchical)
-        .contentTransition(.symbolEffect(.replace.magic(fallback: .replace.wholeSymbol)))
-        .animation(.easeInOut(duration: 0.5), value: alternate)
-        .animation(.easeInOut(duration: 0.5), value: model.state.phase)
-        .onReceive(Timer.publish(every: 0.8, on: .main, in: .common).autoconnect()) { _ in
-            if model.state.phase != "online" { alternate.toggle() }
+        let timer = Timer(timeInterval: 0.8, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
         }
-        .accessibilityLabel(model.state.phase == "online" ? "校园网已连接" : "校园网未连接")
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
+    func stop() {
+        timer?.invalidate()
+        stateSubscription?.cancel()
+        NSStatusBar.system.removeStatusItem(item)
+    }
+
+    private func tick() {
+        guard phase != "online" else { return }
+        alternate.toggle()
+        showSymbol(alternate ? "network.slash" : "network")
+    }
+
+    private func symbol(_ name: String) -> NSImage {
+        NSImage(systemSymbolName: name, accessibilityDescription: name)!
+            .withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 17, weight: .regular)
+                    .applying(.preferringHierarchical())
+            )!
+    }
+
+    private func showSymbol(_ name: String) {
+        guard name != symbolName else { return }
+        symbolName = name
+        icon.setSymbolImage(symbol(name), contentTransition: .replace.magic(fallback: .replace.wholeSymbol))
+    }
+
+    private func updateAccessibility() {
+        item.button?.setAccessibilityLabel(phase == "online" ? "校园网已连接" : "校园网未连接")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        func info(_ title: String) {
+            let item = menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+        }
+        @discardableResult
+        func action(_ title: String, _ selector: Selector) -> NSMenuItem {
+            let item = menu.addItem(withTitle: title, action: selector, keyEquivalent: "")
+            item.target = self
+            return item
+        }
+        menu.removeAllItems()
+        info(model.statusText)
+        if !model.state.network.isEmpty { info(model.state.network) }
+        if !model.diagnosticText.isEmpty { info(model.diagnosticText) }
+        menu.addItem(.separator())
+        action("立即检查", #selector(checkNow))
+        action("诊断", #selector(runDoctor))
+        action("设置…", #selector(openSettings))
+        if model.permissionStatus != .authorized {
+            action("申请定位权限", #selector(requestLocationPermission))
+            action("打开定位设置", #selector(openLocationSettings))
+        }
+        menu.addItem(.separator())
+        info("启动：\(model.launchStatus)")
+        menu.addItem(.separator())
+        action(model.updateMenuTitle, #selector(checkForUpdates)).isEnabled = model.updateActionEnabled
+        menu.addItem(.separator())
+        action("退出", #selector(quit))
+    }
+
+    @objc private func checkNow() { model.checkNow() }
+    @objc private func runDoctor() { model.runDoctor() }
+    @objc private func openSettings() { model.openSettingsWindow() }
+    @objc private func requestLocationPermission() { model.requestLocationPermissionIfNeeded() }
+    @objc private func openLocationSettings() { model.openLocationSettings() }
+    @objc private func checkForUpdates() { model.checkForUpdatesNow() }
+    @objc private func quit() { model.quit() }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var instanceLock: AppInstanceLock?
+    private var statusBar: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NotificationCenter.default.addObserver(
@@ -1644,12 +1690,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         AppModel.shared.start()
+        statusBar = StatusBarController(model: AppModel.shared)
         signalReadinessIfRequested()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: nil)
         AppModel.shared.stop()
+        statusBar?.stop()
+        statusBar = nil
     }
 
     @objc private func settingsWindowWillClose(_ notification: Notification) {
@@ -1716,7 +1765,13 @@ private final class LockedAppState: @unchecked Sendable {
 }
 
 enum SelfTest {
+    @MainActor
     static func run() {
+        let statusBar = StatusBarController(model: .shared)
+        let menu = NSMenu()
+        statusBar.menuNeedsUpdate(menu)
+        precondition(menu.items.contains { $0.title == "设置…" && $0.isEnabled })
+        statusBar.stop()
         precondition(!usableIPv4("127.0.0.1"))
         precondition(!usableIPv4("169.254.1.1"))
         precondition(usableIPv4("10.183.0.2"))
@@ -1983,12 +2038,6 @@ struct NetworkAutoApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuContent(model: AppModel.shared)
-                .padding(8)
-        } label: {
-            MenuBarLabel(model: AppModel.shared)
-        }
         Settings {
             SettingsView(model: AppModel.shared)
         }
