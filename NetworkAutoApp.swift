@@ -8,7 +8,6 @@ import Foundation
 import Network
 import ServiceManagement
 import Symbols
-import SwiftUI
 import UserNotifications
 
 private let appDisplayName = "Csust-Network-Automation"
@@ -1079,6 +1078,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     @Published private(set) var config: AppConfig
     @Published private(set) var state: AppState
+    @Published private(set) var internetConnected = false
     @Published private(set) var permissionStatus: CLAuthorizationStatus
     @Published private(set) var networks: [WiFiNetwork] = []
     @Published private(set) var diagnosticText = ""
@@ -1097,11 +1097,12 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private var updateDisplayTimer: Timer?
     private var lastUpdatePublishedAt: Date?
     private var connectivityTimer: Timer?
+    private let internetQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.internet", qos: .utility)
+    private var internetProbeRunning = false
     private var started = false
     private var isCheckingForUpdate = false
     private var isInstallingUpdate = false
     private var manualCheckRequested = false
-    private var settingsWindowOpening = false
 
     private lazy var engine: AutoLoginEngine = {
         AutoLoginEngine(
@@ -1158,9 +1159,14 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
         RunLoop.main.add(updateDisplayTimer, forMode: .common)
         self.updateDisplayTimer = updateDisplayTimer
-        connectivityTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.requestCheck() }
+        let connectivityTimer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.requestCheck()
+            }
         }
+        RunLoop.main.add(connectivityTimer, forMode: .common)
+        self.connectivityTimer = connectivityTimer
+        probeInternet()
         requestLocationPermissionIfNeeded()
         refreshNetworks()
         engine.start()
@@ -1169,7 +1175,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
                 guard let self else { return }
                 guard case .failure = self.store.effectiveConfig() else { return }
-                self.openSettingsWindow()
+                (NSApp.delegate as? AppDelegate)?.openSettingsWindow()
             }
         }
     }
@@ -1188,13 +1194,28 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     func requestCheck() {
+        probeInternet()
         refreshNetworks()
         engine.request()
+    }
+
+    private func probeInternet() {
+        guard !internetProbeRunning else { return }
+        internetProbeRunning = true
+        internetQueue.async { [weak self] in
+            let connected = LoginService.hasInternetConnectivity(stillConnected: { true })
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.internetProbeRunning = false
+                self.internetConnected = connected
+            }
+        }
     }
 
     func checkNow() {
         manualCheckRequested = true
         diagnosticText = "正在检查…"
+        probeInternet()
         refreshNetworks()
         engine.checkNow()
     }
@@ -1322,7 +1343,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         alert.informativeText = "\(update.name)\(revision)\n是否下载并安装？"
         alert.addButton(withTitle: "更新")
         alert.addButton(withTitle: "稍后")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        NSApp.setActivationPolicy(.regular)
+        let choice = alert.runModal()
+        (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
+        guard choice == .alertFirstButtonReturn else { return }
 
         isInstallingUpdate = true
         updater.downloadAndInstall(update) { [weak self] result in
@@ -1339,7 +1363,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: "好")
+        NSApp.setActivationPolicy(.regular)
         alert.runModal()
+        (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
     }
 
     var statusText: String {
@@ -1410,42 +1436,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     func handleAuthorizationChange() {
         permissionStatus = locationManager.authorizationStatus
         refreshNetworks()
-        restoreBackgroundActivationIfNeeded()
         requestCheck()
-    }
-
-    func restoreBackgroundActivationIfNeeded() {
-        guard !settingsWindowOpening else { return }
-        let settingsWindowIsVisible = NSApp.windows.contains {
-            $0.isVisible && $0.identifier?.rawValue == settingsWindowIdentifier
-        }
-        guard !settingsWindowIsVisible else { return }
-        NSApp.setActivationPolicy(.accessory)
-    }
-
-    func prepareSettingsWindow() {
-        settingsWindowOpening = true
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-            guard let self, self.settingsWindowOpening else { return }
-            self.settingsWindowOpening = false
-            self.restoreBackgroundActivationIfNeeded()
-        }
-    }
-
-    func openSettingsWindow() {
-        prepareSettingsWindow()
-        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-            settingsWindowOpening = false
-            restoreBackgroundActivationIfNeeded()
-            diagnosticText = "无法打开设置窗口，请从菜单栏重新打开“设置…”。"
-        }
-    }
-
-    func settingsWindowDidAppear() {
-        settingsWindowOpening = false
-        NSApp.setActivationPolicy(.regular)
     }
 
     func quit() {
@@ -1457,84 +1448,71 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 }
 
-struct SettingsView: View {
-    @ObservedObject var model: AppModel
-    @State private var draft: AppConfig
-    @State private var message = ""
+@MainActor
+private final class SettingsWindowController: NSWindowController {
+    private let model: AppModel
+    private let username = NSTextField()
+    private let password = NSSecureTextField()
+    private let feedback = NSTextField(labelWithString: "")
 
     init(model: AppModel) {
         self.model = model
-        let config = model.config
-        _draft = State(initialValue: config)
-    }
-
-    var body: some View {
-        Form {
-            Section("校园网络") {
-                TextField("账号", text: $draft.username)
-                SecureField("密码", text: $draft.password)
-                Text("SSID：\(campusSSID)")
-                Text("认证地址：\(campusLoginURL.absoluteString)")
-                    .textSelection(.enabled)
-            }
-            Section("连接方式") {
-                Text("自动适配 macOS 系统代理/PAC：先直连，失败后使用系统代理。")
-                Text("在校园网内每 5 秒检查互联网连通性；未收到 204 响应时自动尝试认证。")
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Section {
-                HStack {
-                    Button("保存") { save() }
-                    Button("立即检查") { model.checkNow() }
-                    Button("诊断") { model.runDoctor() }
-                }
-                if !message.isEmpty {
-                    Text(message).foregroundStyle(.secondary)
-                }
-                if !model.diagnosticText.isEmpty {
-                    Text(model.diagnosticText)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-            }
-        }
-        .formStyle(.grouped)
-        .frame(width: 620)
-        .padding()
-        .background(SettingsWindowConfiguration())
-        .onAppear { reload() }
-    }
-
-    private func reload() {
-        draft = model.config
-    }
-
-    private func save() {
-        guard let error = draft.validationError() else {
-            model.saveConfig(draft)
-            message = "配置已保存。"
-            return
-        }
-        message = error
-    }
-}
-
-private struct SettingsWindowConfiguration: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        SettingsWindowProbe()
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}
-
-@MainActor
-private final class SettingsWindowProbe: NSView {
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard let window else { return }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 180),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "设置"
         window.identifier = NSUserInterfaceItemIdentifier(settingsWindowIdentifier)
         window.collectionBehavior = [.managed, .primary]
-        AppModel.shared.settingsWindowDidAppear()
+        window.center()
+        super.init(window: window)
+
+        username.placeholderString = "账号"
+        password.placeholderString = "密码"
+        username.setAccessibilityLabel("校园网账号")
+        password.setAccessibilityLabel("校园网密码")
+        feedback.textColor = .secondaryLabelColor
+        feedback.lineBreakMode = .byTruncatingTail
+        let save = NSButton(title: "保存", target: self, action: #selector(saveConfig))
+        let fields = NSStackView(views: [username, password, feedback, save])
+        fields.orientation = .vertical
+        fields.spacing = 12
+        fields.alignment = .leading
+        for field in [username, password, feedback] {
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        }
+        fields.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView?.addSubview(fields)
+        NSLayoutConstraint.activate([
+            fields.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 30),
+            fields.trailingAnchor.constraint(lessThanOrEqualTo: window.contentView!.trailingAnchor, constant: -30),
+            fields.centerYAnchor.constraint(equalTo: window.contentView!.centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    override func showWindow(_ sender: Any?) {
+        username.stringValue = model.config.username
+        password.stringValue = model.config.password
+        feedback.stringValue = ""
+        super.showWindow(sender)
+        window?.deminiaturize(sender)
+        window?.makeKeyAndOrderFront(sender)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func saveConfig() {
+        let draft = AppConfig(username: username.stringValue, password: password.stringValue)
+        if let error = draft.validationError() {
+            feedback.stringValue = error
+            return
+        }
+        model.saveConfig(draft)
+        feedback.stringValue = model.diagnosticText
     }
 }
 
@@ -1544,15 +1522,20 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: 28)
     private let icon = NSImageView(frame: .zero)
     private let menu = NSMenu()
-    private var stateSubscription: AnyCancellable?
+    private var connectivitySubscription: AnyCancellable?
     private var timer: Timer?
-    private var phase: String
-    private var alternate = false
-    private var symbolName = "network"
+    private var statusItem: NSMenuItem?
+    private var networkItem: NSMenuItem?
+    private var diagnosticItem: NSMenuItem?
+    private var launchItem: NSMenuItem?
+    private var updateItem: NSMenuItem?
+    private var permissionItem: NSMenuItem?
+    private var locationSettingsItem: NSMenuItem?
+    private var online: Bool
 
     init(model: AppModel) {
         self.model = model
-        phase = model.state.phase
+        online = model.internetConnected
         super.init()
         guard let button = item.button else { return }
         button.image = nil
@@ -1565,33 +1548,20 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
             icon.widthAnchor.constraint(equalToConstant: 20),
             icon.heightAnchor.constraint(equalToConstant: 20),
         ])
-        icon.image = symbol("network")
+        icon.image = symbol(online ? "network" : "network.slash")
+        if !online { icon.addSymbolEffect(.wiggle.clockwise.byLayer, options: .repeating) }
         menu.delegate = self
         item.menu = menu
         updateAccessibility()
-        stateSubscription = model.$state.map(\.phase).removeDuplicates().sink { [weak self] phase in
-            self?.phase = phase
-            self?.alternate = false
-            self?.showSymbol("network")
-            self?.updateAccessibility()
+        connectivitySubscription = model.$internetConnected.removeDuplicates().sink { [weak self] online in
+            self?.setConnectivity(online)
         }
-        let timer = Timer(timeInterval: 0.8, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
     }
 
     func stop() {
         timer?.invalidate()
-        stateSubscription?.cancel()
+        connectivitySubscription?.cancel()
         NSStatusBar.system.removeStatusItem(item)
-    }
-
-    private func tick() {
-        guard phase != "online" else { return }
-        alternate.toggle()
-        showSymbol(alternate ? "network.slash" : "network")
     }
 
     private func symbol(_ name: String) -> NSImage {
@@ -1602,14 +1572,44 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
             )!
     }
 
-    private func showSymbol(_ name: String) {
-        guard name != symbolName else { return }
-        symbolName = name
-        icon.setSymbolImage(symbol(name), contentTransition: .replace.magic(fallback: .replace.wholeSymbol))
+    private func setConnectivity(_ connected: Bool) {
+        guard online != connected else { return }
+        online = connected
+        icon.removeAllSymbolEffects()
+        icon.image = symbol(connected ? "network" : "network.slash")
+        if !connected { icon.addSymbolEffect(.wiggle.clockwise.byLayer, options: .repeating) }
+        updateAccessibility()
     }
 
     private func updateAccessibility() {
-        item.button?.setAccessibilityLabel(phase == "online" ? "校园网已连接" : "校园网未连接")
+        item.button?.setAccessibilityLabel(online ? "互联网已连接" : "互联网未连接")
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshMenu()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshMenu() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func refreshMenu() {
+        statusItem?.title = model.statusText
+        networkItem?.title = model.state.network
+        networkItem?.isHidden = model.state.network.isEmpty
+        diagnosticItem?.title = model.diagnosticText
+        diagnosticItem?.isHidden = model.diagnosticText.isEmpty
+        launchItem?.title = "启动：\(model.launchStatus)"
+        updateItem?.title = model.updateMenuTitle
+        updateItem?.isEnabled = model.updateActionEnabled
+        permissionItem?.isHidden = model.permissionStatus == .authorized
+        locationSettingsItem?.isHidden = model.permissionStatus == .authorized
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -1625,27 +1625,34 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         }
         menu.removeAllItems()
         info(model.statusText)
-        if !model.state.network.isEmpty { info(model.state.network) }
-        if !model.diagnosticText.isEmpty { info(model.diagnosticText) }
+        statusItem = menu.items.last
+        info(model.state.network)
+        networkItem = menu.items.last
+        networkItem?.isHidden = model.state.network.isEmpty
+        info(model.diagnosticText)
+        diagnosticItem = menu.items.last
+        diagnosticItem?.isHidden = model.diagnosticText.isEmpty
         menu.addItem(.separator())
         action("立即检查", #selector(checkNow))
         action("诊断", #selector(runDoctor))
         action("设置…", #selector(openSettings))
-        if model.permissionStatus != .authorized {
-            action("申请定位权限", #selector(requestLocationPermission))
-            action("打开定位设置", #selector(openLocationSettings))
-        }
+        permissionItem = action("申请定位权限", #selector(requestLocationPermission))
+        locationSettingsItem = action("打开定位设置", #selector(openLocationSettings))
+        permissionItem?.isHidden = model.permissionStatus == .authorized
+        locationSettingsItem?.isHidden = model.permissionStatus == .authorized
         menu.addItem(.separator())
         info("启动：\(model.launchStatus)")
+        launchItem = menu.items.last
         menu.addItem(.separator())
-        action(model.updateMenuTitle, #selector(checkForUpdates)).isEnabled = model.updateActionEnabled
+        updateItem = action(model.updateMenuTitle, #selector(checkForUpdates))
+        updateItem?.isEnabled = model.updateActionEnabled
         menu.addItem(.separator())
         action("退出", #selector(quit))
     }
 
     @objc private func checkNow() { model.checkNow() }
     @objc private func runDoctor() { model.runDoctor() }
-    @objc private func openSettings() { model.openSettingsWindow() }
+    @objc private func openSettings() { (NSApp.delegate as? AppDelegate)?.openSettingsWindow() }
     @objc private func requestLocationPermission() { model.requestLocationPermissionIfNeeded() }
     @objc private func openLocationSettings() { model.openLocationSettings() }
     @objc private func checkForUpdates() { model.checkForUpdatesNow() }
@@ -1656,11 +1663,12 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var instanceLock: AppInstanceLock?
     private var statusBar: StatusBarController?
+    private var settingsWindow: SettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(settingsWindowWillClose(_:)),
+            selector: #selector(windowVisibilityChanged(_:)),
             name: NSWindow.willCloseNotification,
             object: nil
         )
@@ -1689,8 +1697,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        NSApp.setActivationPolicy(.accessory)
         AppModel.shared.start()
         statusBar = StatusBarController(model: AppModel.shared)
+        updateActivationPolicy()
         signalReadinessIfRequested()
     }
 
@@ -1701,14 +1711,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBar = nil
     }
 
-    @objc private func settingsWindowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow,
-              window.identifier?.rawValue == settingsWindowIdentifier else {
-            return
-        }
-        DispatchQueue.main.async {
-            AppModel.shared.restoreBackgroundActivationIfNeeded()
-        }
+    func openSettingsWindow() {
+        if settingsWindow == nil { settingsWindow = SettingsWindowController(model: .shared) }
+        NSApp.setActivationPolicy(.regular)
+        settingsWindow?.showWindow(nil)
+    }
+
+    @objc private func windowVisibilityChanged(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.updateActivationPolicy() }
+    }
+
+    func refreshActivationPolicy() { updateActivationPolicy() }
+
+    private func updateActivationPolicy() {
+        let hasPage = NSApp.windows.contains { $0.isVisible }
+        NSApp.setActivationPolicy(hasPage ? .regular : .accessory)
     }
 
     private func signalReadinessIfRequested() {
@@ -2034,12 +2051,11 @@ enum SelfTest {
 }
 
 @main
-struct NetworkAutoApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-
-    var body: some Scene {
-        Settings {
-            SettingsView(model: AppModel.shared)
-        }
+enum NetworkAutoApp {
+    @MainActor static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
     }
 }
