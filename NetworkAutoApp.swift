@@ -1524,6 +1524,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     private var connectivitySubscription: AnyCancellable?
     private var timer: Timer?
+    private var animationTimer: Timer?
     private var statusItem: NSMenuItem?
     private var networkItem: NSMenuItem?
     private var diagnosticItem: NSMenuItem?
@@ -1549,7 +1550,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
             icon.heightAnchor.constraint(equalToConstant: 20),
         ])
         icon.image = symbol(online ? "network" : "network.slash")
-        if !online { icon.addSymbolEffect(.wiggle.clockwise.byLayer, options: .repeating) }
+        if !online { startOfflineAnimation() }
         menu.delegate = self
         item.menu = menu
         updateAccessibility()
@@ -1560,6 +1561,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
     func stop() {
         timer?.invalidate()
+        animationTimer?.invalidate()
         connectivitySubscription?.cancel()
         NSStatusBar.system.removeStatusItem(item)
     }
@@ -1575,10 +1577,28 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private func setConnectivity(_ connected: Bool) {
         guard online != connected else { return }
         online = connected
-        icon.removeAllSymbolEffects()
-        icon.image = symbol(connected ? "network" : "network.slash")
-        if !connected { icon.addSymbolEffect(.wiggle.clockwise.byLayer, options: .repeating) }
+        animationTimer?.invalidate()
+        animationTimer = nil
+        icon.setSymbolImage(
+            symbol(connected ? "network" : "network.slash"),
+            contentTransition: .replace.upUp.byLayer
+        )
+        if !connected { startOfflineAnimation() }
         updateAccessibility()
+    }
+
+    private func startOfflineAnimation() {
+        let timer = Timer(timeInterval: 0.8, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.icon.setSymbolImage(
+                    self.symbol("network.slash"),
+                    contentTransition: .replace.upUp.byLayer
+                )
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
     }
 
     private func updateAccessibility() {
