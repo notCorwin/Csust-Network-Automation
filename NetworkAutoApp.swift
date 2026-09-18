@@ -1538,6 +1538,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         self.model = model
         online = model.internetConnected
         super.init()
+        item.autosaveName = "NetworkAuto"
         guard let button = item.button else { return }
         button.image = nil
         icon.translatesAutoresizingMaskIntoConstraints = false
