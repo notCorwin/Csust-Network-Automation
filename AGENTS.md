@@ -11,9 +11,7 @@
 7. 每隔 3 分钟通过 GitHub Releases 获取一次软件的最新版本。
 8. 随开机自动启动，并保持后台运行。
 9. 下拉菜单保持实时刷新。
-10. 让 Dock presence 跟随主界面生命周期。
-    1. 无页面时保持 accessory app
-    2. 有页面时恢复 regular app
+10. 让 Dock icon 随 app 的 window lifecycle 动态显隐，只有实际 UI 打开时才进入 Dock。
 
 
 ## 菜单栏 SF Symbols 动画组件

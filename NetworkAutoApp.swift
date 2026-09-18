@@ -1744,8 +1744,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func refreshActivationPolicy() { updateActivationPolicy() }
 
     private func updateActivationPolicy() {
-        let hasPage = NSApp.windows.contains { $0.isVisible }
-        NSApp.setActivationPolicy(hasPage ? .regular : .accessory)
+        let hasUI = settingsWindow?.window?.isVisible == true || NSApp.modalWindow?.isVisible == true
+        NSApp.setActivationPolicy(hasUI ? .regular : .accessory)
     }
 
     private func signalReadinessIfRequested() {
@@ -1808,6 +1808,8 @@ enum SelfTest {
         let menu = NSMenu()
         statusBar.menuNeedsUpdate(menu)
         precondition(menu.items.contains { $0.title == "设置…" && $0.isEnabled })
+        (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
+        precondition(NSApp.activationPolicy() == .accessory)
         statusBar.stop()
         precondition(!usableIPv4("127.0.0.1"))
         precondition(!usableIPv4("169.254.1.1"))
