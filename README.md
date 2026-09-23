@@ -6,10 +6,10 @@
 
 ## 功能
 
-- Wi‑Fi 和网络路径变化时立即检查；每 5 秒分别请求 Google 的 `https://www.google.com/generate_204` 和 Apple 的 `https://captive.apple.com/hotspot-detect.html`，独立显示两者的连通状态。Google 收到空的 HTTP 204 响应才视为互联网可用。离开校园网后仍检测连通性，但不发送认证请求。
+- Wi‑Fi 和网络路径变化时立即检查；每 5 秒分别请求 Google 的 `https://www.google.com/generate_204` 和 Apple 的 `https://captive.apple.com/hotspot-detect.html`，独立显示两者的连通状态。Google 需返回空的 HTTP 204，Apple 需返回预期的成功页面。离开校园网后仍检测连通性，但不发送认证请求。
 - 认证失败后立即重试，账号或密码被拒绝时暂停，等待修改配置或手动重试。
 - 认证时先尝试直连，再尝试 macOS 系统代理或 PAC；HTTPS 使用系统证书校验。
-- 菜单栏在互联网可用时显示 SF Symbols `network`，不可用时显示持续执行按图层、向上到向上替换动画的 `network.slash`。下拉菜单依次显示校园网认证状态、Apple 和 Google 连通状态，以及立即登录校园网、检查更新、设置和退出。
+- 菜单栏仅在 Apple 和 Google 均可达，且当前连接校园网时已登录，才显示 SF Symbols `network`；否则显示持续执行按图层、向上到向上替换动画的 `network.slash`。连接其他 Wi‑Fi 时无需校园网登录条件。下拉菜单依次显示校园网认证状态、Apple 和 Google 连通状态，以及立即登录校园网、检查更新、设置和退出。
 - Dock 图标仅在设置窗口或提示框打开时显示，关闭后恢复为后台菜单栏 App。
 - 自动注册登录时启动，每 3 分钟检查一次 GitHub `autobuild` Release；有更新时在菜单中显示提交哈希和发布时间，点击更新项并确认后安装。安装前校验 SHA-256 摘要、归档内容和 App 身份。
 

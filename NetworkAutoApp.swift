@@ -408,6 +408,12 @@ func campusConnectionStatus(networks: [WiFiNetwork], permissionAuthorized: Bool,
     }
 }
 
+func hasInternetEvidence(google: Bool, apple: Bool, networks: [WiFiNetwork], state: AppState) -> Bool {
+    guard google && apple else { return false }
+    guard let campus = selectNetwork(networks) else { return true }
+    return state.network == campus.key && state.phase == "online"
+}
+
 private func interfaceIPv4Addresses() -> [String: String] {
     var result: [String: String] = [:]
     var addressPointer: UnsafeMutablePointer<ifaddrs>?
@@ -896,7 +902,9 @@ final class AutoLoginEngine: @unchecked Sendable {
     init(
         store: AppStore,
         snapshot: EngineSnapshot,
-        connectivityCheck: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Bool = { LoginService.hasInternetConnectivity(stillConnected: $0) },
+        connectivityCheck: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Bool = {
+            LoginService.hasInternetConnectivity(stillConnected: $0) && LoginService.hasAppleConnectivity()
+        },
         authenticate: @escaping @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String) = { LoginService.login(config: $0, ip: $1, stillConnected: $2) },
         onUpdate: (@Sendable (AppState, Bool) -> Void)? = nil
     ) {
@@ -1526,7 +1534,12 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
     init(model: AppModel) {
         self.model = model
-        online = model.internetConnected
+        online = hasInternetEvidence(
+            google: model.internetConnected,
+            apple: model.appleConnected,
+            networks: model.networks,
+            state: model.state
+        )
         super.init()
         item.autosaveName = "NetworkAuto"
         guard let button = item.button else { return }
@@ -1545,9 +1558,17 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         updateAccessibility()
-        connectivitySubscription = model.$internetConnected.removeDuplicates().sink { [weak self] online in
-            self?.setConnectivity(online)
+        connectivitySubscription = Publishers.CombineLatest4(
+            model.$internetConnected,
+            model.$appleConnected,
+            model.$networks,
+            model.$state
+        )
+        .map { google, apple, networks, state in
+            hasInternetEvidence(google: google, apple: apple, networks: networks, state: state)
         }
+        .removeDuplicates()
+        .sink { [weak self] online in self?.setConnectivity(online) }
     }
 
     func stop() {
@@ -1830,6 +1851,15 @@ enum SelfTest {
         precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "登录中")
         campusState.checking = false
         precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "认证失败")
+        precondition(!hasInternetEvidence(google: true, apple: true, networks: [campus], state: campusState))
+        campusState.phase = "online"
+        precondition(hasInternetEvidence(google: true, apple: true, networks: [campus], state: campusState))
+        precondition(!hasInternetEvidence(google: false, apple: true, networks: [campus], state: campusState))
+        precondition(!hasInternetEvidence(google: true, apple: false, networks: [campus], state: campusState))
+        let otherWiFi = WiFiNetwork(interfaceName: "en0", ssid: "other", bssid: "bb", ip: "192.0.2.2")
+        precondition(hasInternetEvidence(google: true, apple: true, networks: [otherWiFi], state: campusState))
+        precondition(!hasInternetEvidence(google: false, apple: true, networks: [otherWiFi], state: campusState))
+        precondition(!hasInternetEvidence(google: true, apple: false, networks: [otherWiFi], state: campusState))
         precondition(config.validationError() == nil)
         let encodedConfig = try! JSONEncoder().encode(config)
         precondition(String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
