@@ -1193,7 +1193,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
         RunLoop.main.add(updateDisplayTimer, forMode: .common)
         self.updateDisplayTimer = updateDisplayTimer
-        let connectivityTimer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+        let connectivityTimer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.requestCheck()
             }
