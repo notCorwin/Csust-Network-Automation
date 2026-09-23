@@ -6,10 +6,10 @@
 
 ## 功能
 
-- Wi‑Fi 和网络路径变化时立即检查；每 5 秒请求一次 `https://www.google.com/generate_204`，收到空的 HTTP 204 响应才视为互联网可用。离开校园网后仍检测连通性，但不发送认证请求。
+- Wi‑Fi 和网络路径变化时立即检查；每 5 秒分别请求 Google 的 `https://www.google.com/generate_204` 和 Apple 的 `https://captive.apple.com/hotspot-detect.html`，独立显示两者的连通状态。Google 收到空的 HTTP 204 响应才视为互联网可用。离开校园网后仍检测连通性，但不发送认证请求。
 - 认证失败后立即重试，账号或密码被拒绝时暂停，等待修改配置或手动重试。
 - 认证时先尝试直连，再尝试 macOS 系统代理或 PAC；HTTPS 使用系统证书校验。
-- 菜单栏在互联网可用时显示 SF Symbols `network`，不可用时显示持续执行按图层、向上到向上替换动画的 `network.slash`。菜单提供实时状态、立即检查、诊断、设置、更新和退出。
+- 菜单栏在互联网可用时显示 SF Symbols `network`，不可用时显示持续执行按图层、向上到向上替换动画的 `network.slash`。下拉菜单依次显示校园网认证状态、Apple 和 Google 连通状态，以及立即登录校园网、检查更新、设置和退出。
 - Dock 图标仅在设置窗口或提示框打开时显示，关闭后恢复为后台菜单栏 App。
 - 自动注册登录时启动，每 3 分钟检查一次 GitHub `autobuild` Release；有更新时在菜单中显示提交哈希和发布时间，点击更新项并确认后安装。安装前校验 SHA-256 摘要、归档内容和 App 身份。
 
@@ -33,11 +33,11 @@ cd Csust-Network-Automation
 bash install.sh
 ```
 
-安装器会构建和测试 App，将其放入 `~/Applications/NetworkAuto.app`，启动并注册登录时自动启动。首次打开时，在菜单栏的网络图标 → **设置…** 中保存校园网账号和密码；设置窗口只包含这两个字段及保存按钮。然后按系统提示允许定位权限。连接 `CSUST-Student` 后即可自动检查和认证；需要主动检查时选择 **立即检查**，需要查看认证服务器连接情况时选择 **诊断**。
+安装器会构建和测试 App，将其放入 `~/Applications/NetworkAuto.app`，启动并注册登录时自动启动。首次打开时，在菜单栏的网络图标 → **设置** 中保存校园网账号和密码；设置窗口只包含这两个字段及保存按钮。然后按系统提示允许定位权限。连接 `CSUST-Student` 后即可自动检查和认证；选择 **立即登录校园网** 会在校园网内强制重新认证，即使当前已联网。
 
 从旧版 `CampusAutoLogin.app` 升级时，请重新运行安装脚本。安装成功后，它会移除 `~/Applications` 或 `/Applications` 中同一 Bundle ID 的旧 App；Bundle ID 和用户数据位置保持不变，以沿用已保存的账号密码及登录启动配置。
 
-如果系统没有显示定位权限提示，可在菜单栏选择 **申请定位权限** 或 **打开定位设置**。在“系统设置 → 隐私与安全性 → 定位服务”中检查 App 及“系统服务 → 网络与无线”的权限。没有可读取的 SSID 时，App 无法判断是否在校园网。
+如果系统没有显示定位权限提示，请在“系统设置 → 隐私与安全性 → 定位服务”中检查 App 及“系统服务 → 网络与无线”的权限。没有可读取的 SSID 时，App 无法判断是否在校园网。
 
 卸载 App 和旧版登录启动配置：
 
@@ -64,6 +64,6 @@ App 图标来自 [原始 PNG](Assets/NetworkAutoIcon.png)，构建时使用 [mac
 
 ## 获取帮助与贡献
 
-遇到问题请到 [Issues](https://github.com/notCorwin/Csust-Network-Automation/issues) 提交 macOS 版本、机器架构、复现步骤和菜单栏诊断结果。分享诊断或日志前，请先移除账号、密码及不愿公开的网络信息。
+遇到问题请到 [Issues](https://github.com/notCorwin/Csust-Network-Automation/issues) 提交 macOS 版本、机器架构、复现步骤和相关日志。分享日志前，请先移除账号、密码及不愿公开的网络信息。
 
 欢迎提交聚焦的修改；提交前运行上述验证命令。项目由 [@notCorwin](https://github.com/notCorwin) 维护。

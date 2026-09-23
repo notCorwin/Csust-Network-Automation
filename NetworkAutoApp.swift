@@ -14,6 +14,8 @@ private let appDisplayName = "Csust-Network-Automation"
 private let campusSSID = "CSUST-Student"
 private let campusLoginURL = URL(string: "https://login.csust.edu.cn:802/eportal/portal/login")!
 private let connectivityURL = URL(string: "https://www.google.com/generate_204")!
+private let appleConnectivityURL = URL(string: "https://captive.apple.com/hotspot-detect.html")!
+private let appleConnectivityResponse = Data("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>".utf8)
 private let loginRequestTimeoutSecs: TimeInterval = 15
 private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
@@ -394,6 +396,18 @@ func selectNetwork(_ networks: [WiFiNetwork]) -> WiFiNetwork? {
     networks.first { $0.ssid == campusSSID }
 }
 
+func campusConnectionStatus(networks: [WiFiNetwork], permissionAuthorized: Bool, state: AppState) -> String {
+    guard permissionAuthorized else { return "需要定位权限" }
+    guard let network = selectNetwork(networks) else { return "未连接" }
+    guard state.network == network.key else { return "未登录" }
+    switch state.phase {
+    case "credentials": return state.checking ? "登录中" : "认证失败"
+    case "config_error": return state.checking ? "登录中" : "设置有误"
+    case "online": return "已登录"
+    default: return state.checking ? "登录中" : "未登录"
+    }
+}
+
 private func interfaceIPv4Addresses() -> [String: String] {
     var result: [String: String] = [:]
     var addressPointer: UnsafeMutablePointer<ifaddrs>?
@@ -540,6 +554,28 @@ enum LoginService {
         statusCode == 204 && body.isEmpty && redirectLocation == nil
     }
 
+    static func hasAppleConnectivity() -> Bool {
+        var request = URLRequest(url: appleConnectivityURL)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        guard case .success(let response) = perform(
+            request: request,
+            route: "system",
+            shouldContinue: { true },
+            systemProxy: nil,
+            timeout: 4
+        ) else { return false }
+        return isAppleConnectivityEvidence(
+            statusCode: response.statusCode,
+            body: response.body,
+            redirectLocation: response.redirectLocation
+        )
+    }
+
+    static func isAppleConnectivityEvidence(statusCode: Int, body: Data, redirectLocation: String?) -> Bool {
+        statusCode == 200 && body == appleConnectivityResponse && redirectLocation == nil
+    }
+
     static func login(
         config: AppConfig,
         ip: String,
@@ -621,26 +657,6 @@ enum LoginService {
             .retry(errors.isEmpty ? "认证失败，将立即重试。" : errors.joined(separator: "；")),
             lastRoute
         )
-    }
-
-    static func probe(config: AppConfig, route: String) -> Result<Int, AppError> {
-        if let error = config.validationError() {
-            return .failure(AppError(message: error))
-        }
-        guard let rootURL = originURL(campusLoginURL) else {
-            return .failure(AppError(message: "认证地址无效"))
-        }
-        let request = makeRequest(url: rootURL, parameters: [], referer: rootURL.absoluteString)
-            ?? URLRequest(url: rootURL)
-        switch perform(
-            request: request,
-            route: route,
-            shouldContinue: { true },
-            systemProxy: nil
-        ) {
-        case .success(let result): return .success(result.statusCode)
-        case .failure(let error): return .failure(error)
-        }
     }
 
     private static func makeRequest(
@@ -800,7 +816,7 @@ func parseResponse(_ text: String) -> AuthOutcome {
     if trimmed.contains("Dr.COMWebLoginID_2.htm") {
         return .retry("认证被拒绝，请检查认证参数。")
     }
-    return .retry("未收到可确认的认证结果，可运行 App 内诊断检查连接。")
+    return .retry("未收到可确认的认证结果，将自动重试。")
 }
 
 private func routeLabel(_ route: String) -> String {
@@ -867,6 +883,8 @@ final class AutoLoginEngine: @unchecked Sendable {
     private let store: AppStore
     private let logger: LogStore
     private let snapshot: EngineSnapshot
+    private let connectivityCheck: @Sendable (@escaping @Sendable () -> Bool) -> Bool
+    private let authenticate: @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String)
     private let cancellation = CancellationSignal()
     private let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.engine", qos: .utility)
     private var state: AppState
@@ -878,11 +896,15 @@ final class AutoLoginEngine: @unchecked Sendable {
     init(
         store: AppStore,
         snapshot: EngineSnapshot,
+        connectivityCheck: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Bool = { LoginService.hasInternetConnectivity(stillConnected: $0) },
+        authenticate: @escaping @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String) = { LoginService.login(config: $0, ip: $1, stillConnected: $2) },
         onUpdate: (@Sendable (AppState, Bool) -> Void)? = nil
     ) {
         self.store = store
         self.logger = LogStore(paths: store.paths)
         self.snapshot = snapshot
+        self.connectivityCheck = connectivityCheck
+        self.authenticate = authenticate
         self.state = store.loadState()
         self.onUpdate = onUpdate
     }
@@ -950,7 +972,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             state.failureSince = nil
             state.notified = false
         }
-        var shouldProbe = true
+        var shouldProbe = !manual
         while !cancellation.isCancelled() {
             let current = snapshot.read()
             guard current.permissionAuthorized else {
@@ -973,7 +995,7 @@ final class AutoLoginEngine: @unchecked Sendable {
                 state.network = key
                 state.failureSince = nil
                 state.notified = false
-                shouldProbe = true
+                shouldProbe = !manual
             }
 
             let stillConnected: @Sendable () -> Bool = { [snapshot, cancellation] in
@@ -982,7 +1004,7 @@ final class AutoLoginEngine: @unchecked Sendable {
                 return current.permissionAuthorized && selectNetwork(current.networks)?.key == key
             }
             if shouldProbe {
-                if LoginService.hasInternetConnectivity(stillConnected: stillConnected) {
+                if connectivityCheck(stillConnected) {
                     state.attempt = 0
                     record(phase: "online", detail: "互联网连接正常。")
                     return
@@ -1013,8 +1035,11 @@ final class AutoLoginEngine: @unchecked Sendable {
                 return
             }
             state.attempt = state.attempt == UInt32.max ? .max : state.attempt + 1
+            state.phase = "login"
+            state.detail = "正在登录校园网…"
+            publish(state: state, shouldNotify: false)
 
-            let outcome = LoginService.login(config: config, ip: network.ip ?? "", stillConnected: stillConnected)
+            let outcome = authenticate(config, network.ip ?? "", stillConnected)
             switch outcome.0 {
             case .online:
                 state.route = outcome.1
@@ -1079,10 +1104,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     @Published private(set) var config: AppConfig
     @Published private(set) var state: AppState
     @Published private(set) var internetConnected = false
+    @Published private(set) var appleConnected = false
     @Published private(set) var permissionStatus: CLAuthorizationStatus
     @Published private(set) var networks: [WiFiNetwork] = []
     @Published private(set) var diagnosticText = ""
-    @Published private(set) var launchStatus = ""
     @Published private(set) var updateStatus = AppUpdateStatus.idle
     @Published private var updateNow = Date()
 
@@ -1098,7 +1123,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private var lastUpdatePublishedAt: Date?
     private var connectivityTimer: Timer?
     private let internetQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.internet", qos: .utility)
+    private let appleQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.apple", qos: .utility)
     private var internetProbeRunning = false
+    private var appleProbeRunning = false
     private var started = false
     private var isCheckingForUpdate = false
     private var isInstallingUpdate = false
@@ -1138,7 +1165,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         state.phase = ""
         state.detail = ""
         requestNotificationPermission()
-        refreshLaunchStatus()
         registerLaunchAtLogin()
 
         wifiMonitor.onChange = { [weak self] in
@@ -1167,6 +1193,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         RunLoop.main.add(connectivityTimer, forMode: .common)
         self.connectivityTimer = connectivityTimer
         probeInternet()
+        probeApple()
         requestLocationPermissionIfNeeded()
         refreshNetworks()
         engine.start()
@@ -1195,6 +1222,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     func requestCheck() {
         probeInternet()
+        probeApple()
         refreshNetworks()
         engine.request()
     }
@@ -1212,10 +1240,24 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
     }
 
+    private func probeApple() {
+        guard !appleProbeRunning else { return }
+        appleProbeRunning = true
+        appleQueue.async { [weak self] in
+            let connected = LoginService.hasAppleConnectivity()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.appleProbeRunning = false
+                self.appleConnected = connected
+            }
+        }
+    }
+
     func checkNow() {
         manualCheckRequested = true
         diagnosticText = "正在检查…"
         probeInternet()
+        probeApple()
         refreshNetworks()
         engine.checkNow()
     }
@@ -1246,43 +1288,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.locationManager.requestWhenInUseAuthorization()
-        }
-    }
-
-    func openLocationSettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices")!
-        if !NSWorkspace.shared.open(url) {
-            diagnosticText = "无法打开定位设置，请在系统设置中手动打开定位服务。"
-        }
-    }
-
-    func runDoctor() {
-        diagnosticText = "正在诊断…"
-        let currentNetworks = wifiMonitor.networks()
-        let configResult = store.effectiveConfig()
-        DispatchQueue.global(qos: .utility).async { [weak self, currentNetworks, configResult] in
-            var lines = currentNetworks.map {
-                "网卡 \($0.interfaceName)：IPv4=\($0.ip ?? "未分配")，SSID=\($0.ssid ?? "不可读取")，BSSID=\($0.bssid ?? "不可读取")"
-            }
-            switch configResult {
-            case .failure(let error):
-                lines.append("配置：\(error.message)")
-            case .success(let config):
-                if let network = selectNetwork(currentNetworks) {
-                    lines.append("匹配校园网络：\(network.key)")
-                    for route in routeNames() {
-                        switch LoginService.probe(config: config, route: route) {
-                        case .success(let status): lines.append("\(routeLabel(route))：服务器可达，HTTP \(status)")
-                        case .failure(let error): lines.append("\(routeLabel(route))：\(error.message)")
-                        }
-                    }
-                } else {
-                    lines.append("当前不在配置的校园网络，未发送认证请求。")
-                }
-            }
-            Task { @MainActor [weak self, lines] in
-                self?.diagnosticText = lines.joined(separator: "\n")
-            }
         }
     }
 
@@ -1413,24 +1418,12 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    private func refreshLaunchStatus() {
-        let status = SMAppService.mainApp.status
-        switch status {
-        case .enabled: launchStatus = "已启用"
-        case .requiresApproval: launchStatus = "等待系统批准"
-        case .notRegistered: launchStatus = "未启用"
-        case .notFound: launchStatus = "未找到 App 服务"
-        @unknown default: launchStatus = "未知状态"
-        }
-    }
-
     private func registerLaunchAtLogin() {
         do {
             try SMAppService.mainApp.register()
         } catch {
             diagnosticText = "登录启动注册失败：\(error.localizedDescription)"
         }
-        refreshLaunchStatus()
     }
 
     func handleAuthorizationChange() {
@@ -1525,13 +1518,10 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private var connectivitySubscription: AnyCancellable?
     private var timer: Timer?
     private var animationTimer: Timer?
-    private var statusItem: NSMenuItem?
-    private var networkItem: NSMenuItem?
-    private var diagnosticItem: NSMenuItem?
-    private var launchItem: NSMenuItem?
+    private var campusItem: NSMenuItem?
+    private var appleItem: NSMenuItem?
+    private var googleItem: NSMenuItem?
     private var updateItem: NSMenuItem?
-    private var permissionItem: NSMenuItem?
-    private var locationSettingsItem: NSMenuItem?
     private var online: Bool
 
     init(model: AppModel) {
@@ -1621,16 +1611,12 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func refreshMenu() {
-        statusItem?.title = model.statusText
-        networkItem?.title = model.state.network
-        networkItem?.isHidden = model.state.network.isEmpty
-        diagnosticItem?.title = model.diagnosticText
-        diagnosticItem?.isHidden = model.diagnosticText.isEmpty
-        launchItem?.title = "启动：\(model.launchStatus)"
+        campusItem?.title = "校园网：\(campusConnectionStatus(networks: model.networks, permissionAuthorized: model.permissionStatus == .authorized, state: model.state))"
+        campusItem?.toolTip = model.statusText
+        appleItem?.title = "Apple：\(model.appleConnected ? "已连接" : "未连接")"
+        googleItem?.title = "Google：\(model.internetConnected ? "已连接" : "未连接")"
         updateItem?.title = model.updateMenuTitle
         updateItem?.isEnabled = model.updateActionEnabled
-        permissionItem?.isHidden = model.permissionStatus == .authorized
-        locationSettingsItem?.isHidden = model.permissionStatus == .authorized
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -1645,37 +1631,24 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
             return item
         }
         menu.removeAllItems()
-        info(model.statusText)
-        statusItem = menu.items.last
-        info(model.state.network)
-        networkItem = menu.items.last
-        networkItem?.isHidden = model.state.network.isEmpty
-        info(model.diagnosticText)
-        diagnosticItem = menu.items.last
-        diagnosticItem?.isHidden = model.diagnosticText.isEmpty
+        info("")
+        campusItem = menu.items.last
+        info("")
+        appleItem = menu.items.last
+        info("")
+        googleItem = menu.items.last
         menu.addItem(.separator())
-        action("立即检查", #selector(checkNow))
-        action("诊断", #selector(runDoctor))
-        action("设置…", #selector(openSettings))
-        permissionItem = action("申请定位权限", #selector(requestLocationPermission))
-        locationSettingsItem = action("打开定位设置", #selector(openLocationSettings))
-        permissionItem?.isHidden = model.permissionStatus == .authorized
-        locationSettingsItem?.isHidden = model.permissionStatus == .authorized
-        menu.addItem(.separator())
-        info("启动：\(model.launchStatus)")
-        launchItem = menu.items.last
+        action("立即登录校园网", #selector(checkNow))
         menu.addItem(.separator())
         updateItem = action(model.updateMenuTitle, #selector(checkForUpdates))
         updateItem?.isEnabled = model.updateActionEnabled
-        menu.addItem(.separator())
+        action("设置", #selector(openSettings))
         action("退出", #selector(quit))
+        refreshMenu()
     }
 
     @objc private func checkNow() { model.checkNow() }
-    @objc private func runDoctor() { model.runDoctor() }
     @objc private func openSettings() { (NSApp.delegate as? AppDelegate)?.openSettingsWindow() }
-    @objc private func requestLocationPermission() { model.requestLocationPermissionIfNeeded() }
-    @objc private func openLocationSettings() { model.openLocationSettings() }
     @objc private func checkForUpdates() { model.checkForUpdatesNow() }
     @objc private func quit() { model.quit() }
 }
@@ -1808,7 +1781,15 @@ enum SelfTest {
         let statusBar = StatusBarController(model: .shared)
         let menu = NSMenu()
         statusBar.menuNeedsUpdate(menu)
-        precondition(menu.items.contains { $0.title == "设置…" && $0.isEnabled })
+        precondition(menu.items.count == 9)
+        precondition(menu.items[0].title.hasPrefix("校园网："))
+        precondition(menu.items[1].title.hasPrefix("Apple："))
+        precondition(menu.items[2].title.hasPrefix("Google："))
+        precondition(menu.items[3].isSeparatorItem && menu.items[5].isSeparatorItem)
+        precondition(menu.items[4].title == "立即登录校园网" && menu.items[4].isEnabled)
+        precondition(menu.items[6].title == "检查更新" && menu.items[6].isEnabled)
+        precondition(menu.items[7].title == "设置" && menu.items[7].isEnabled)
+        precondition(menu.items[8].title == "退出" && menu.items[8].isEnabled)
         (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
         precondition(NSApp.activationPolicy() == .accessory)
         statusBar.stop()
@@ -1832,6 +1813,23 @@ enum SelfTest {
         precondition(LoginService.isConnectivityEvidence(statusCode: 204, body: Data(), redirectLocation: nil))
         precondition(!LoginService.isConnectivityEvidence(statusCode: 200, body: Data(), redirectLocation: nil))
         precondition(!LoginService.isConnectivityEvidence(statusCode: 302, body: Data(), redirectLocation: "https://portal.example"))
+        precondition(LoginService.isAppleConnectivityEvidence(statusCode: 200, body: appleConnectivityResponse, redirectLocation: nil))
+        precondition(!LoginService.isAppleConnectivityEvidence(statusCode: 200, body: Data("Login".utf8), redirectLocation: nil))
+        precondition(!LoginService.isAppleConnectivityEvidence(statusCode: 302, body: appleConnectivityResponse, redirectLocation: "https://portal.example"))
+        let campus = WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: "10.183.0.2")
+        var campusState = AppState()
+        precondition(campusConnectionStatus(networks: [], permissionAuthorized: true, state: campusState) == "未连接")
+        precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: false, state: campusState) == "需要定位权限")
+        precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "未登录")
+        campusState.network = campus.key
+        campusState.checking = true
+        precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "登录中")
+        campusState.phase = "online"
+        precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "已登录")
+        campusState.phase = "credentials"
+        precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "登录中")
+        campusState.checking = false
+        precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "认证失败")
         precondition(config.validationError() == nil)
         let encodedConfig = try! JSONEncoder().encode(config)
         precondition(String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
@@ -1845,6 +1843,7 @@ enum SelfTest {
         updateParsing()
         storeMigrationAndPersistence()
         engineCancellationAndMutex()
+        manualLoginBypassesConnectivity()
         httpLogin(proxy: false)
         httpLogin(proxy: true)
         print("NetworkAuto self-test passed")
@@ -1991,9 +1990,9 @@ enum SelfTest {
         permissionSnapshot.update(networks: [], permissionAuthorized: false)
         let permissionWaiting = DispatchSemaphore(value: 0)
         do {
-            let permissionEngine = AutoLoginEngine(store: store, snapshot: permissionSnapshot) { state, _ in
+            let permissionEngine = AutoLoginEngine(store: store, snapshot: permissionSnapshot, onUpdate: { state, _ in
                 if state.phase == "permission" { permissionWaiting.signal() }
-            }
+            })
             permissionEngine.start()
             precondition(permissionWaiting.wait(timeout: .now() + 3) == .success)
             permissionEngine.stop()
@@ -2005,10 +2004,10 @@ enum SelfTest {
         )
         let observed = LockedAppState()
         let waiting = DispatchSemaphore(value: 0)
-        let engine = AutoLoginEngine(store: store, snapshot: snapshot) { state, _ in
+        let engine = AutoLoginEngine(store: store, snapshot: snapshot, onUpdate: { state, _ in
             observed.set(state)
             if state.phase == "outside" && !state.checking { waiting.signal() }
-        }
+        })
         engine.start()
         precondition(waiting.wait(timeout: .now() + 3) == .success)
         precondition(observed.get().phase == "outside")
@@ -2016,6 +2015,55 @@ enum SelfTest {
         let started = Date()
         engine.stop()
         precondition(Date().timeIntervalSince(started) < 1)
+    }
+
+    private static func manualLoginBypassesConnectivity() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("csust-manual-test-\(UUID().uuidString)")
+        let paths = AppPaths(
+            data: root,
+            legacyConfig: root.appendingPathComponent("config.json"),
+            legacyState: root.appendingPathComponent("state.json"),
+            logs: root.appendingPathComponent("logs", isDirectory: true)
+        )
+        let suiteName = "csust-manual-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = AppStore(defaults: defaults, paths: paths)
+        try! store.saveConfig(AppConfig(username: "account", password: "password"))
+        let snapshot = EngineSnapshot()
+        snapshot.update(
+            networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: "10.183.0.2")],
+            permissionAuthorized: true
+        )
+        let authentication = LockedString()
+        let completed = DispatchSemaphore(value: 0)
+        let engine = AutoLoginEngine(
+            store: store,
+            snapshot: snapshot,
+            connectivityCheck: { _ in true },
+            authenticate: { _, _, _ in
+                authentication.set("called")
+                return (.online, "direct")
+            },
+            onUpdate: { state, _ in
+                if !state.checking && (state.phase == "online" || state.phase == "outside") { completed.signal() }
+            }
+        )
+        engine.start()
+        precondition(completed.wait(timeout: .now() + 3) == .success)
+        precondition(authentication.get().isEmpty)
+        engine.checkNow()
+        precondition(completed.wait(timeout: .now() + 3) == .success)
+        precondition(authentication.get() == "called")
+        authentication.set("")
+        snapshot.update(networks: [WiFiNetwork(interfaceName: "en0", ssid: "other", bssid: nil, ip: nil)], permissionAuthorized: true)
+        engine.checkNow()
+        precondition(completed.wait(timeout: .now() + 3) == .success)
+        precondition(authentication.get().isEmpty)
+        engine.stop()
     }
 
     private static func httpLogin(proxy: Bool) {
