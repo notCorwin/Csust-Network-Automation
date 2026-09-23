@@ -1313,10 +1313,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         alert.informativeText = "\(update.name)\(revision)\n是否下载并安装？"
         alert.addButton(withTitle: "更新")
         alert.addButton(withTitle: "稍后")
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        let choice = alert.runModal()
-        (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
+        let choice = runFocusedAlert(alert)
         guard choice == .alertFirstButtonReturn else { return }
 
         isInstallingUpdate = true
@@ -1334,10 +1331,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: "好")
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-        (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
+        runFocusedAlert(alert)
     }
 
     var statusText: String {
@@ -1628,6 +1622,17 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 }
 
 @MainActor
+@discardableResult
+private func runFocusedAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
+    NSApp.setActivationPolicy(.regular)
+    alert.window.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+    let response = alert.runModal()
+    (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
+    return response
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var instanceLock: AppInstanceLock?
     private var statusBar: StatusBarController?
@@ -1705,13 +1710,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showStartupError(_ message: String) {
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = appDisplayName
         alert.informativeText = message
         alert.addButton(withTitle: "好")
-        alert.runModal()
+        runFocusedAlert(alert)
     }
 }
 
