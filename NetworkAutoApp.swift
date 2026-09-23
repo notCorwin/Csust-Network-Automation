@@ -1357,6 +1357,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         alert.addButton(withTitle: "更新")
         alert.addButton(withTitle: "稍后")
         NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
         let choice = alert.runModal()
         (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
         guard choice == .alertFirstButtonReturn else { return }
@@ -1377,6 +1378,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         alert.informativeText = message
         alert.addButton(withTitle: "好")
         NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
         (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
     }
