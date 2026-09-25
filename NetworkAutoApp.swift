@@ -1625,7 +1625,13 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 @discardableResult
 private func runFocusedAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
     NSApp.setActivationPolicy(.regular)
-    alert.window.makeKeyAndOrderFront(nil)
+    alert.layout()
+    let window = alert.window
+    window.center()
+    if let screen = window.screen {
+        window.setFrameOrigin(NSPoint(x: window.frame.minX, y: screen.visibleFrame.midY - window.frame.height / 2))
+    }
+    window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
     let response = alert.runModal()
     (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
