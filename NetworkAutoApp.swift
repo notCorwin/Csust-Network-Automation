@@ -13,7 +13,6 @@ import UserNotifications
 private let appDisplayName = "Csust-Network-Automation"
 private let campusSSID = "CSUST-Student"
 private let campusLoginURL = URL(string: "https://login.csust.edu.cn:802/eportal/portal/login")!
-private let connectivityURL = URL(string: "https://www.google.com/generate_204")!
 private let loginRequestTimeoutSecs: TimeInterval = 15
 private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
@@ -154,18 +153,37 @@ final class EngineSnapshot: @unchecked Sendable {
     private let lock = NSLock()
     private var networks: [WiFiNetwork] = []
     private var permissionAuthorized = false
+    private var internetConnected = false
+    private var generation: UInt64 = 0
 
     func update(networks: [WiFiNetwork], permissionAuthorized: Bool) {
         lock.lock()
+        if self.networks != networks {
+            internetConnected = false
+            generation &+= 1
+        }
         self.networks = networks
         self.permissionAuthorized = permissionAuthorized
         lock.unlock()
     }
 
-    func read() -> (networks: [WiFiNetwork], permissionAuthorized: Bool) {
+    func updateConnectivity(_ connected: Bool) {
+        lock.lock()
+        internetConnected = connected
+        lock.unlock()
+    }
+
+    func invalidateNetwork() {
+        lock.lock()
+        generation &+= 1
+        internetConnected = false
+        lock.unlock()
+    }
+
+    func read() -> (networks: [WiFiNetwork], permissionAuthorized: Bool, internetConnected: Bool, generation: UInt64) {
         lock.lock()
         defer { lock.unlock() }
-        return (networks, permissionAuthorized)
+        return (networks, permissionAuthorized, internetConnected, generation)
     }
 }
 
@@ -406,12 +424,6 @@ func campusConnectionStatus(networks: [WiFiNetwork], permissionAuthorized: Bool,
     }
 }
 
-func hasInternetEvidence(google: Bool, networks: [WiFiNetwork], state: AppState) -> Bool {
-    guard google else { return false }
-    guard let campus = selectNetwork(networks) else { return true }
-    return state.network == campus.key && state.phase == "online"
-}
-
 private func interfaceIPv4Addresses() -> [String: String] {
     var result: [String: String] = [:]
     var addressPointer: UnsafeMutablePointer<ifaddrs>?
@@ -536,28 +548,6 @@ private final class HTTPResponseBox: @unchecked Sendable {
 }
 
 enum LoginService {
-    static func hasInternetConnectivity(stillConnected: @escaping @Sendable () -> Bool) -> Bool {
-        var request = URLRequest(url: connectivityURL)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        guard case .success(let response) = perform(
-            request: request,
-            route: "system",
-            shouldContinue: stillConnected,
-            systemProxy: nil,
-            timeout: 4
-        ) else { return false }
-        return isConnectivityEvidence(
-            statusCode: response.statusCode,
-            body: response.body,
-            redirectLocation: response.redirectLocation
-        )
-    }
-
-    static func isConnectivityEvidence(statusCode: Int, body: Data, redirectLocation: String?) -> Bool {
-        statusCode == 204 && body.isEmpty && redirectLocation == nil
-    }
-
     static func login(
         config: AppConfig,
         ip: String,
@@ -865,7 +855,6 @@ final class AutoLoginEngine: @unchecked Sendable {
     private let store: AppStore
     private let logger: LogStore
     private let snapshot: EngineSnapshot
-    private let connectivityCheck: @Sendable (@escaping @Sendable () -> Bool) -> Bool
     private let authenticate: @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String)
     private let cancellation = CancellationSignal()
     private let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.engine", qos: .utility)
@@ -873,21 +862,18 @@ final class AutoLoginEngine: @unchecked Sendable {
     private var running = false
     private var pending = false
     private var scheduled = false
+    private var authenticatedGeneration: UInt64?
     var onUpdate: (@Sendable (AppState, Bool) -> Void)?
 
     init(
         store: AppStore,
         snapshot: EngineSnapshot,
-        connectivityCheck: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Bool = {
-            LoginService.hasInternetConnectivity(stillConnected: $0)
-        },
         authenticate: @escaping @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String) = { LoginService.login(config: $0, ip: $1, stillConnected: $2) },
         onUpdate: (@Sendable (AppState, Bool) -> Void)? = nil
     ) {
         self.store = store
         self.logger = LogStore(paths: store.paths)
         self.snapshot = snapshot
-        self.connectivityCheck = connectivityCheck
         self.authenticate = authenticate
         self.state = store.loadState()
         self.onUpdate = onUpdate
@@ -956,7 +942,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             state.failureSince = nil
             state.notified = false
         }
-        var shouldProbe = !manual
+        var useInternetEvidence = !manual
         while !cancellation.isCancelled() {
             let current = snapshot.read()
             guard current.permissionAuthorized else {
@@ -979,21 +965,22 @@ final class AutoLoginEngine: @unchecked Sendable {
                 state.network = key
                 state.failureSince = nil
                 state.notified = false
-                shouldProbe = !manual
+                useInternetEvidence = !manual
             }
 
+            let generation = current.generation
             let stillConnected: @Sendable () -> Bool = { [snapshot, cancellation] in
                 guard !cancellation.isCancelled() else { return false }
                 let current = snapshot.read()
-                return current.permissionAuthorized && selectNetwork(current.networks)?.key == key
+                return current.permissionAuthorized && current.generation == generation && selectNetwork(current.networks)?.key == key
             }
-            if shouldProbe {
-                if connectivityCheck(stillConnected) {
+            if useInternetEvidence {
+                if authenticatedGeneration == generation && current.internetConnected && stillConnected() {
                     state.attempt = 0
                     record(phase: "online", detail: "互联网连接正常。")
                     return
                 }
-                shouldProbe = false
+                useInternetEvidence = false
             }
             guard stillConnected() else { continue }
 
@@ -1019,15 +1006,18 @@ final class AutoLoginEngine: @unchecked Sendable {
                 return
             }
             state.attempt = state.attempt == UInt32.max ? .max : state.attempt + 1
-            state.phase = "login"
-            state.detail = "正在登录校园网…"
+            let confirmingSession = authenticatedGeneration == generation && state.phase == "online"
+            if !confirmingSession { state.phase = "login" }
+            state.detail = confirmingSession ? "正在确认校园网会话…" : "正在登录校园网…"
             publish(state: state, shouldNotify: false)
 
             let outcome = authenticate(config, network.ip ?? "", stillConnected)
+            guard stillConnected() else { continue }
             switch outcome.0 {
             case .online:
+                authenticatedGeneration = generation
                 state.route = outcome.1
-                record(phase: "online", detail: "登录成功或已经在线。")
+                record(phase: "online", detail: confirmingSession ? "校园网会话有效。" : "登录成功或已经在线。")
                 return
             case .credentials:
                 state.route = outcome.1
@@ -1087,7 +1077,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     @Published private(set) var config: AppConfig
     @Published private(set) var state: AppState
-    @Published private(set) var internetConnected = false
+    @Published private(set) var internetStatus: InternetStatus = .unknown
     @Published private(set) var permissionStatus: CLAuthorizationStatus
     @Published private(set) var networks: [WiFiNetwork] = []
     @Published private(set) var diagnosticText = ""
@@ -1099,14 +1089,13 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let locationManager = CLLocationManager()
     private let wifiMonitor = WiFiMonitor()
     private let engineSnapshot = EngineSnapshot()
-    private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
+    private let pathMonitor = NWPathMonitor()
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.path")
     private var updateCheckTimer: Timer?
     private var updateDisplayTimer: Timer?
     private var lastUpdatePublishedAt: Date?
     private var connectivityTimer: Timer?
-    private let internetQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.internet", qos: .utility)
-    private var internetProbeRunning = false
+    private let internetMonitor = ClashConnectivityMonitor()
     private var started = false
     private var isCheckingForUpdate = false
     private var isInstallingUpdate = false
@@ -1152,8 +1141,21 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
         wifiMonitor.start()
-        pathMonitor.pathUpdateHandler = { [weak self] _ in
-            Task { @MainActor [weak self] in self?.requestCheck() }
+        let workspaceNotifications = NSWorkspace.shared.notificationCenter
+        workspaceNotifications.addObserver(self, selector: #selector(networkWillSleep(_:)), name: NSWorkspace.willSleepNotification, object: nil)
+        workspaceNotifications.addObserver(self, selector: #selector(networkDidWake(_:)), name: NSWorkspace.didWakeNotification, object: nil)
+        internetMonitor.onChange = { [weak self] status in
+            guard let self else { return }
+            self.internetStatus = status
+            self.engineSnapshot.updateConnectivity(status == .online)
+        }
+        internetMonitor.start()
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor [weak self] in
+                self?.engineSnapshot.invalidateNetwork()
+                self?.internetMonitor.reset(networkAvailable: path.status == .satisfied)
+                self?.requestCheck()
+            }
         }
         pathMonitor.start(queue: pathQueue)
         let updateCheckTimer = Timer(timeInterval: 3 * 60, repeats: true) { [weak self] _ in
@@ -1173,7 +1175,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
         RunLoop.main.add(connectivityTimer, forMode: .common)
         self.connectivityTimer = connectivityTimer
-        probeInternet()
         requestLocationPermissionIfNeeded()
         refreshNetworks()
         engine.start()
@@ -1194,6 +1195,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         updateDisplayTimer = nil
         connectivityTimer?.invalidate()
         connectivityTimer = nil
+        internetMonitor.stop()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         pathMonitor.cancel()
         wifiMonitor.stop()
         engine.stop()
@@ -1201,28 +1204,24 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     func requestCheck() {
-        probeInternet()
         refreshNetworks()
         engine.request()
     }
 
-    private func probeInternet() {
-        guard !internetProbeRunning else { return }
-        internetProbeRunning = true
-        internetQueue.async { [weak self] in
-            let connected = LoginService.hasInternetConnectivity(stillConnected: { true })
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.internetProbeRunning = false
-                self.internetConnected = connected
-            }
-        }
+    @objc private func networkWillSleep(_ notification: Notification) {
+        engineSnapshot.invalidateNetwork()
+        internetMonitor.reset(networkAvailable: false)
+    }
+
+    @objc private func networkDidWake(_ notification: Notification) {
+        engineSnapshot.invalidateNetwork()
+        internetMonitor.reset(networkAvailable: pathMonitor.currentPath.status == .satisfied)
+        requestCheck()
     }
 
     func checkNow() {
         manualCheckRequested = true
         diagnosticText = "正在检查…"
-        probeInternet()
         refreshNetworks()
         engine.checkNow()
     }
@@ -1368,7 +1367,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     private func refreshNetworks() {
-        networks = wifiMonitor.networks()
+        let refreshed = wifiMonitor.networks()
+        if networks != refreshed { internetMonitor.reset() }
+        networks = refreshed
         engineSnapshot.update(
             networks: networks,
             permissionAuthorized: isLocationAuthorized
@@ -1480,17 +1481,13 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private var timer: Timer?
     private var animationTimer: Timer?
     private var campusItem: NSMenuItem?
-    private var googleItem: NSMenuItem?
+    private var internetItem: NSMenuItem?
     private var updateItem: NSMenuItem?
     private var online: Bool
 
     init(model: AppModel) {
         self.model = model
-        online = hasInternetEvidence(
-            google: model.internetConnected,
-            networks: model.networks,
-            state: model.state
-        )
+        online = model.internetStatus == .online
         super.init()
         item.autosaveName = "NetworkAuto"
         guard let button = item.button else { return }
@@ -1509,16 +1506,12 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         updateAccessibility()
-        connectivitySubscription = Publishers.CombineLatest3(
-            model.$internetConnected,
-            model.$networks,
-            model.$state
-        )
-        .map { google, networks, state in
-            hasInternetEvidence(google: google, networks: networks, state: state)
-        }
+        connectivitySubscription = model.$internetStatus
         .removeDuplicates()
-        .sink { [weak self] online in self?.setConnectivity(online) }
+        .sink { [weak self] status in
+            self?.setConnectivity(status == .online)
+            self?.item.button?.setAccessibilityLabel("互联网：\(status.title)")
+        }
     }
 
     func stop() {
@@ -1584,7 +1577,8 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private func refreshMenu() {
         campusItem?.title = "校园网：\(campusConnectionStatus(networks: model.networks, permissionAuthorized: model.permissionStatus == .authorized, state: model.state))"
         campusItem?.toolTip = model.statusText
-        googleItem?.title = "Google：\(model.internetConnected ? "已连接" : "未连接")"
+        internetItem?.title = "互联网：\(model.internetStatus.title)"
+        internetItem?.toolTip = "根据 Clash 实际代理连接的近期收包判断；没有流量不代表断网。"
         updateItem?.title = model.updateMenuTitle
         updateItem?.isEnabled = model.updateActionEnabled
     }
@@ -1604,7 +1598,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         info("")
         campusItem = menu.items.last
         info("")
-        googleItem = menu.items.last
+        internetItem = menu.items.last
         menu.addItem(.separator())
         action("立即登录校园网", #selector(checkNow))
         menu.addItem(.separator())
@@ -1766,7 +1760,7 @@ enum SelfTest {
         statusBar.menuNeedsUpdate(menu)
         precondition(menu.items.count == 8)
         precondition(menu.items[0].title.hasPrefix("校园网："))
-        precondition(menu.items[1].title.hasPrefix("Google："))
+        precondition(menu.items[1].title.hasPrefix("互联网："))
         precondition(menu.items[2].isSeparatorItem && menu.items[4].isSeparatorItem)
         precondition(menu.items[3].title == "立即登录校园网" && menu.items[3].isEnabled)
         precondition(menu.items[5].title == "检查更新" && menu.items[5].isEnabled)
@@ -1792,9 +1786,6 @@ enum SelfTest {
         precondition(parseResponse("dr1003({\"result\":1});") == .online)
         precondition(parseResponse("dr1003({\"msg\":\"密码错误\"});") == .credentials)
         precondition(parseResponse("dr1003({\"msg\":\"10.183.0.2 已经在线！\"});") == .online)
-        precondition(LoginService.isConnectivityEvidence(statusCode: 204, body: Data(), redirectLocation: nil))
-        precondition(!LoginService.isConnectivityEvidence(statusCode: 200, body: Data(), redirectLocation: nil))
-        precondition(!LoginService.isConnectivityEvidence(statusCode: 302, body: Data(), redirectLocation: "https://portal.example"))
         let campus = WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: "10.183.0.2")
         var campusState = AppState()
         precondition(campusConnectionStatus(networks: [], permissionAuthorized: true, state: campusState) == "未连接")
@@ -1809,13 +1800,6 @@ enum SelfTest {
         precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "登录中")
         campusState.checking = false
         precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "认证失败")
-        precondition(!hasInternetEvidence(google: true, networks: [campus], state: campusState))
-        campusState.phase = "online"
-        precondition(hasInternetEvidence(google: true, networks: [campus], state: campusState))
-        precondition(!hasInternetEvidence(google: false, networks: [campus], state: campusState))
-        let otherWiFi = WiFiNetwork(interfaceName: "en0", ssid: "other", bssid: "bb", ip: "192.0.2.2")
-        precondition(hasInternetEvidence(google: true, networks: [otherWiFi], state: campusState))
-        precondition(!hasInternetEvidence(google: false, networks: [otherWiFi], state: campusState))
         precondition(config.validationError() == nil)
         let encodedConfig = try! JSONEncoder().encode(config)
         precondition(String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
@@ -1830,6 +1814,7 @@ enum SelfTest {
         storeMigrationAndPersistence()
         engineCancellationAndMutex()
         manualLoginBypassesConnectivity()
+        ClashConnectivitySelfTest.run()
         httpLogin(proxy: false)
         httpLogin(proxy: true)
         print("NetworkAuto self-test passed")
@@ -2024,12 +2009,12 @@ enum SelfTest {
             networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: "10.183.0.2")],
             permissionAuthorized: true
         )
+        snapshot.updateConnectivity(true)
         let authentication = LockedString()
         let completed = DispatchSemaphore(value: 0)
         let engine = AutoLoginEngine(
             store: store,
             snapshot: snapshot,
-            connectivityCheck: { _ in true },
             authenticate: { _, _, _ in
                 authentication.set("called")
                 return (.online, "direct")
@@ -2040,7 +2025,17 @@ enum SelfTest {
         )
         engine.start()
         precondition(completed.wait(timeout: .now() + 3) == .success)
+        precondition(authentication.get() == "called") // Internet traffic cannot authenticate campus Wi-Fi.
+        authentication.set("")
+        engine.request()
+        precondition(completed.wait(timeout: .now() + 3) == .success)
         precondition(authentication.get().isEmpty)
+        snapshot.updateConnectivity(false)
+        engine.request()
+        precondition(completed.wait(timeout: .now() + 3) == .success)
+        precondition(authentication.get() == "called") // Confirm campus session without probing external sites.
+        authentication.set("")
+        snapshot.updateConnectivity(true)
         engine.checkNow()
         precondition(completed.wait(timeout: .now() + 3) == .success)
         precondition(authentication.get() == "called")
@@ -2050,6 +2045,33 @@ enum SelfTest {
         precondition(completed.wait(timeout: .now() + 3) == .success)
         precondition(authentication.get().isEmpty)
         engine.stop()
+
+        // A reconnect with the same BSSID/IP must invalidate an in-flight authentication result.
+        snapshot.update(networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: "10.183.0.2")], permissionAuthorized: true)
+        let observed = LockedAppState()
+        let reconnected = DispatchSemaphore(value: 0)
+        let reconnectEngine = AutoLoginEngine(
+            store: store,
+            snapshot: snapshot,
+            authenticate: { _, _, stillConnected in
+                if authentication.get().isEmpty {
+                    authentication.set("first")
+                    snapshot.invalidateNetwork()
+                    precondition(!stillConnected())
+                    return (.credentials, "direct")
+                }
+                authentication.set("second")
+                return (.online, "direct")
+            },
+            onUpdate: { state, _ in
+                observed.set(state)
+                if !state.checking && state.phase == "online" { reconnected.signal() }
+            }
+        )
+        reconnectEngine.start()
+        precondition(reconnected.wait(timeout: .now() + 3) == .success)
+        precondition(authentication.get() == "second" && !observed.get().credentialsBlocked)
+        reconnectEngine.stop()
     }
 
     private static func httpLogin(proxy: Bool) {

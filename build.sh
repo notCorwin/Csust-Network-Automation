@@ -19,7 +19,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typechec
   -framework Network \
   -framework ServiceManagement \
   -framework UserNotifications \
-  NetworkAutoApp.swift AppUpdater.swift
+  NetworkAutoApp.swift AppUpdater.swift ClashConnectivity.swift
 swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
 	-target arm64-apple-macosx15.0 \
 	-framework AppKit \
@@ -29,7 +29,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
   -framework Network \
   -framework ServiceManagement \
   -framework UserNotifications \
-  -o "$EXECUTABLE" NetworkAutoApp.swift AppUpdater.swift
+  -o "$EXECUTABLE" NetworkAutoApp.swift AppUpdater.swift ClashConnectivity.swift
 cp Info.plist "$APP_PATH/Contents/Info.plist"
 cp Assets/NetworkAuto.icns "$APP_PATH/Contents/Resources/NetworkAuto.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleSourceRevision $APP_REVISION" "$APP_PATH/Contents/Info.plist"
