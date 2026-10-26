@@ -1147,7 +1147,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         internetMonitor.onChange = { [weak self] status in
             guard let self else { return }
             self.internetStatus = status
-            self.engineSnapshot.updateConnectivity(status == .online)
+            self.engineSnapshot.updateConnectivity(status.isConnected)
         }
         internetMonitor.start()
         pathMonitor.pathUpdateHandler = { [weak self] path in
@@ -1487,7 +1487,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
     init(model: AppModel) {
         self.model = model
-        online = model.internetStatus == .online
+        online = model.internetStatus.isConnected
         super.init()
         item.autosaveName = "NetworkAuto"
         guard let button = item.button else { return }
@@ -1509,7 +1509,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         connectivitySubscription = model.$internetStatus
         .removeDuplicates()
         .sink { [weak self] status in
-            self?.setConnectivity(status == .online)
+            self?.setConnectivity(status.isConnected)
             self?.item.button?.setAccessibilityLabel("互联网：\(status.title)")
         }
     }
@@ -1578,7 +1578,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         campusItem?.title = "校园网：\(campusConnectionStatus(networks: model.networks, permissionAuthorized: model.permissionStatus == .authorized, state: model.state))"
         campusItem?.toolTip = model.statusText
         internetItem?.title = "互联网：\(model.internetStatus.title)"
-        internetItem?.toolTip = "根据 Clash 实际代理连接的近期收包判断；没有流量不代表断网。"
+        internetItem?.toolTip = model.internetStatus.detail
         updateItem?.title = model.updateMenuTitle
         updateItem?.isEnabled = model.updateActionEnabled
     }

@@ -3,6 +3,7 @@ import Foundation
 
 enum InternetStatus: Equatable, Sendable {
     case online
+    case dnsStalled(connected: Bool)
     case unknown
     case clashUnavailable
     case offline
@@ -10,9 +11,27 @@ enum InternetStatus: Equatable, Sendable {
     var title: String {
         switch self {
         case .online: "已连接"
+        case .dnsStalled(let connected): connected ? "已连接（疑似 DNS 阻塞）" : "疑似 DNS 阻塞"
         case .unknown: "暂无近期流量"
         case .clashUnavailable: "Clash 未就绪"
         case .offline: "未连接"
+        }
+    }
+
+    var isConnected: Bool {
+        switch self {
+        case .online: true
+        case .dnsStalled(let connected): connected
+        default: false
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .dnsStalled:
+            "至少 3 条 Clash 内部 DNS/HTTPS 连接持续 15 秒有发送、无接收；可能影响新连接。仅为被动推断，不代表校园网认证失效。"
+        default:
+            "根据 Clash 实际代理连接的近期收包判断；没有流量不代表断网。"
         }
     }
 }
@@ -25,13 +44,26 @@ struct ClashConnections: Decodable, Sendable {
         let id: String
         let metadata: Metadata
         let download: Int64
+        let upload: Int64
         let chains: [String]
 
         struct Metadata: Decodable, Sendable {
             let host: String
             let destinationPort: String
             let network: String
+            let type: String
             let destinationIP: String?
+        }
+
+        // Mihomo does not expose DNS request completion in /connections. Inner
+        // connections on DNS/HTTPS ports are only a hint, never proof of an outage.
+        var isDNSCandidate: Bool {
+            metadata.type == "Inner"
+                && ["53", "443", "853"].contains(metadata.destinationPort)
+                && ["tcp", "udp"].contains(metadata.network.lowercased())
+                && metadata.destinationIP?.isEmpty == false
+                && !Self.isLocalAddress(metadata.destinationIP)
+                && !chains.contains(where: { ["REJECT", "REJECT-DROP"].contains($0.uppercased()) })
         }
 
         // Reuse Clash's actual routing decision instead of maintaining a domain list.
@@ -82,7 +114,7 @@ enum ClashConnectivitySelfTest {
                       host: String = "example.com", ip: String = "198.18.0.1", port: String = "443") -> ClashConnections {
             let object: [String: Any] = [
                 "downloadTotal": total,
-                "connections": [["id": id, "metadata": ["host": host, "destinationIP": ip, "destinationPort": port, "network": "tcp"],
+                "connections": [["id": id, "metadata": ["host": host, "destinationIP": ip, "destinationPort": port, "network": "tcp", "type": "HTTPS"],
                                  "download": download, "upload": 99999, "chains": [chain, "group"]]]
             ]
             return try! JSONDecoder().decode(ClashConnections.self, from: JSONSerialization.data(withJSONObject: object))
@@ -125,7 +157,66 @@ enum ClashConnectivitySelfTest {
         precondition(snapshotState.read().internetConnected)
         snapshotState.update(networks: [], permissionAuthorized: true)
         precondition(!snapshotState.read().internetConnected)
+        dnsStalls()
         ipcSnapshot()
+    }
+
+    private static func dnsStalls() {
+        func snapshot(download: Int64 = 0, upload: Int64 = 1500, count: Int = 3,
+                      type: String = "Inner", ip: String = "223.5.5.5", port: String = "443",
+                      total: Int64 = 1000, internetDownload: Int64? = nil) -> ClashConnections {
+            var connections = (0..<count).map {
+                ClashConnections.Connection(
+                    id: "dns-\($0)",
+                    metadata: .init(host: "", destinationPort: port, network: "tcp", type: type, destinationIP: ip),
+                    download: download, upload: upload, chains: ["DIRECT"]
+                )
+            }
+            if let internetDownload {
+                connections.append(.init(
+                    id: "internet", metadata: .init(host: "example.com", destinationPort: "443", network: "tcp",
+                                                    type: "Tun", destinationIP: "198.18.0.1"),
+                    download: internetDownload, upload: 10, chains: ["node"]
+                ))
+            }
+            return ClashConnections(downloadTotal: total, connections: connections)
+        }
+        var evidence = ClashTrafficEvidence()
+        // Reproduce many AliDNS connections with only transmitted bytes.
+        precondition(evidence.observe(snapshot(), now: 0) == .unknown)
+        precondition(evidence.observe(snapshot(), now: 14) == .unknown)
+        precondition(evidence.observe(snapshot(), now: 15) == .dnsStalled(connected: false))
+        precondition(!evidence.status(now: 15).isConnected)
+        // Partial internet access must not hide the warning or force the offline icon.
+        precondition(evidence.observe(snapshot(internetDownload: 1), now: 16) == .dnsStalled(connected: true))
+        precondition(evidence.status(now: 16).isConnected)
+        precondition(evidence.status(now: 46) == .dnsStalled(connected: false))
+        // Replies, removal and core/network resets invalidate the suspicion immediately.
+        precondition(evidence.observe(snapshot(download: 1), now: 47) == .unknown)
+        precondition(evidence.observe(snapshot(count: 0), now: 48) == .unknown)
+        _ = evidence.observe(snapshot(), now: 49)
+        precondition(evidence.observe(snapshot(), now: 64) == .dnsStalled(connected: false))
+        precondition(evidence.observe(snapshot(total: 0), now: 65) == .unknown)
+        evidence.reset()
+        precondition(evidence.observe(snapshot(), now: 100) == .unknown)
+        // A long-lived idle connection, one slow resolver or ordinary HTTPS is insufficient.
+        for idle in [snapshot(download: 4000), snapshot(upload: 0), snapshot(count: 2),
+                     snapshot(type: "Tun"), snapshot(ip: "192.168.1.1"), snapshot(port: "123")] {
+            evidence.reset()
+            _ = evidence.observe(idle, now: 0)
+            precondition(evidence.observe(idle, now: 300) == .unknown)
+        }
+        // Reused TLS connections are suspect only after new sends without any new reply.
+        evidence.reset()
+        _ = evidence.observe(snapshot(download: 4000), now: 0)
+        _ = evidence.observe(snapshot(download: 4000, upload: 1600), now: 100)
+        precondition(evidence.observe(snapshot(download: 4000, upload: 1600), now: 114) == .unknown)
+        precondition(evidence.observe(snapshot(download: 4000, upload: 1600), now: 115) == .dnsStalled(connected: false))
+        precondition(evidence.observe(snapshot(download: 4001, upload: 1700), now: 116) == .unknown)
+        precondition(evidence.observe(snapshot(download: 4001, upload: 1700), now: 300) == .unknown)
+        // Packet counters can restart independently of the controller's total counter.
+        precondition(evidence.observe(snapshot(upload: 1), now: 301) == .unknown)
+        precondition(evidence.observe(snapshot(upload: 1), now: 316) == .dnsStalled(connected: false))
     }
 
     private static func ipcSnapshot() {
@@ -178,12 +269,39 @@ enum ClashConnectivitySelfTest {
 
 struct ClashTrafficEvidence {
     static let lifetime: TimeInterval = 30
+    static let dnsResponseTimeout: TimeInterval = 15
+    static let minimumStalledDNSConnections = 3
     private var downloads: [String: Int64] = [:]
+    private var dnsProgress: [String: DNSProgress] = [:]
     private var total: Int64?
     private var lastReply: TimeInterval?
 
+    private struct DNSProgress {
+        let upload: Int64
+        let download: Int64
+        var waitingSince: TimeInterval?
+
+        init(_ connection: ClashConnections.Connection, previous: DNSProgress?, now: TimeInterval) {
+            upload = connection.upload
+            download = connection.download
+            if let previous, upload >= previous.upload, download >= previous.download {
+                if download > previous.download {
+                    waitingSince = nil
+                } else if upload > previous.upload {
+                    waitingSince = previous.waitingSince ?? now
+                } else {
+                    waitingSince = previous.waitingSince
+                }
+            } else {
+                // Existing DoH/DoT keep-alive connections may be completely idle.
+                waitingSince = upload > 0 && download == 0 ? now : nil
+            }
+        }
+    }
+
     mutating func reset() {
         downloads.removeAll(keepingCapacity: true)
+        dnsProgress.removeAll(keepingCapacity: true)
         total = nil
         lastReply = nil
     }
@@ -192,19 +310,31 @@ struct ClashTrafficEvidence {
         if let total, snapshot.downloadTotal < total { reset() }
         let baselineExists = total != nil
         var next: [String: Int64] = [:]
-        for connection in snapshot.connections ?? [] where connection.isInternetCandidate {
-            let previous = downloads[connection.id] ?? 0
-            if baselineExists && connection.download > previous { lastReply = now }
-            next[connection.id] = connection.download
+        var nextDNS: [String: DNSProgress] = [:]
+        for connection in snapshot.connections ?? [] {
+            if connection.isInternetCandidate {
+                let previous = downloads[connection.id] ?? 0
+                if baselineExists && connection.download > previous { lastReply = now }
+                next[connection.id] = connection.download
+            }
+            if connection.isDNSCandidate {
+                nextDNS[connection.id] = DNSProgress(connection, previous: dnsProgress[connection.id], now: now)
+            }
         }
         downloads = next
+        dnsProgress = nextDNS
         total = snapshot.downloadTotal
         return status(now: now)
     }
 
     func status(now: TimeInterval) -> InternetStatus {
-        guard let lastReply, now >= lastReply, now - lastReply < Self.lifetime else { return .unknown }
-        return .online
+        let connected = lastReply.map { now >= $0 && now - $0 < Self.lifetime } ?? false
+        let stalled = dnsProgress.values.filter {
+            guard let since = $0.waitingSince else { return false }
+            return now >= since && now - since >= Self.dnsResponseTimeout
+        }.count
+        if stalled >= Self.minimumStalledDNSConnections { return .dnsStalled(connected: connected) }
+        return connected ? .online : .unknown
     }
 }
 
