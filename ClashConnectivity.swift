@@ -157,6 +157,12 @@ enum ClashConnectivitySelfTest {
         snapshotState.update(networks: [], permissionAuthorized: true)
         precondition(!snapshotState.read().internetConnected)
         dnsStalls()
+        var closePolicy = OutageClosePolicy()
+        precondition(closePolicy.shouldClose(for: .dnsStalled))
+        precondition(!closePolicy.shouldClose(for: .unknown))
+        precondition(!closePolicy.shouldClose(for: .offline))
+        precondition(!closePolicy.shouldClose(for: .online))
+        precondition(closePolicy.shouldClose(for: .offline))
         ipcSnapshot()
     }
 
@@ -181,9 +187,13 @@ enum ClashConnectivitySelfTest {
         // Two simultaneous connections to the same resolver signal an interruption immediately.
         precondition(evidence.observe(snapshot([first, duplicate, internet]), now: 1) == .dnsStalled)
         precondition(!evidence.status(now: 1).isConnected)
-        // Recent internet traffic cannot override the interruption; removal restores that evidence.
-        precondition(evidence.observe(snapshot([first, internet]), now: 2) == .online)
-        precondition(evidence.observe(snapshot([first, duplicate, internet]), now: 3) == .dnsStalled)
+        // Recovery requires new traffic after the duplicate connections disappear.
+        precondition(evidence.observe(snapshot([first, internet]), now: 2) == .unknown)
+        let recoveredInternet = ClashConnections.Connection(
+            id: internet.id, metadata: internet.metadata, download: 2, upload: 10, chains: internet.chains
+        )
+        precondition(evidence.observe(snapshot([first, recoveredInternet]), now: 3) == .online)
+        precondition(evidence.observe(snapshot([first, duplicate, recoveredInternet]), now: 4) == .dnsStalled)
         evidence.reset()
         precondition(evidence.status(now: 3) == .unknown)
         // Different endpoints and excluded connections do not count as duplicates.
@@ -212,28 +222,32 @@ enum ClashConnectivitySelfTest {
                 bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        precondition(bound == 0 && listen(listener, 1) == 0)
+        precondition(bound == 0 && listen(listener, 2) == 0)
         let finished = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
-            let client = accept(listener, nil, nil)
-            precondition(client >= 0)
-            defer { close(client); finished.signal() }
-            var bytes = [UInt8](repeating: 0, count: 4096)
-            let count = recv(client, &bytes, bytes.count, 0)
-            precondition(count > 0)
-            let request = String(decoding: bytes.prefix(count), as: UTF8.self)
-            precondition(request.hasPrefix("GET /connections HTTP/1.0\r\n"))
-            precondition(!request.contains("Authorization"))
-            let response = Array("HTTP/1.0 200 OK\r\n\r\n{\"downloadTotal\":3,\"connections\":null}".utf8)
-            var sent = 0
-            while sent < response.count {
-                let count = response.withUnsafeBytes { send(client, $0.baseAddress!.advanced(by: sent), response.count - sent, 0) }
+            defer { finished.signal() }
+            for method in ["GET", "DELETE"] {
+                let client = accept(listener, nil, nil)
+                precondition(client >= 0)
+                var bytes = [UInt8](repeating: 0, count: 4096)
+                let count = recv(client, &bytes, bytes.count, 0)
                 precondition(count > 0)
-                sent += count
+                let request = String(decoding: bytes.prefix(count), as: UTF8.self)
+                precondition(request.hasPrefix("\(method) /connections HTTP/1.0\r\n"))
+                precondition(!request.contains("Authorization"))
+                let response = Array((method == "GET" ? "HTTP/1.0 200 OK\r\n\r\n{\"downloadTotal\":3,\"connections\":null}" : "HTTP/1.0 204 No Content\r\n\r\n").utf8)
+                var sent = 0
+                while sent < response.count {
+                    let count = response.withUnsafeBytes { send(client, $0.baseAddress!.advanced(by: sent), response.count - sent, 0) }
+                    precondition(count > 0)
+                    sent += count
+                }
+                close(client)
             }
         }
         let snapshot = try! ClashController.readSnapshot(path: path, cancellation: CancellationSignal())
         precondition(snapshot.downloadTotal == 3 && snapshot.connections == nil)
+        try! ClashController.closeConnections(path: path, cancellation: CancellationSignal())
         precondition(finished.wait(timeout: .now() + 3) == .success)
         let cancellation = CancellationSignal()
         cancellation.cancel()
@@ -287,6 +301,8 @@ struct ClashTrafficEvidence {
         }
         downloads = next
         hasDuplicateDNS = duplicateDNS
+        // Only traffic received after the duplicate connections clear can confirm recovery.
+        if duplicateDNS { lastReply = nil }
         total = snapshot.downloadTotal
         return status(now: now)
     }
@@ -331,18 +347,31 @@ enum ClashController {
     }
 
     static func decodeResponse(_ data: Data) throws -> ClashConnections {
+        let body = try responseBody(data, expectedStatus: "200")
+        return try JSONDecoder().decode(ClashConnections.self, from: body)
+    }
+
+    private static func responseBody(_ data: Data, expectedStatus: String) throws -> Data {
         guard data.count <= maximumResponseSize,
               let boundary = data.range(of: Data("\r\n\r\n".utf8)),
               let headers = String(data: data[..<boundary.lowerBound], encoding: .utf8),
               let status = headers.components(separatedBy: "\r\n").first,
-              status.split(separator: " ").dropFirst().first == "200",
+              status.split(separator: " ").dropFirst().first.map(String.init) == expectedStatus,
               !headers.lowercased().contains("transfer-encoding:") else {
             throw URLError(.badServerResponse)
         }
-        return try JSONDecoder().decode(ClashConnections.self, from: data[boundary.upperBound...])
+        return Data(data[boundary.upperBound...])
     }
 
     static func readSnapshot(path: String, cancellation: CancellationSignal) throws -> ClashConnections {
+        try decodeResponse(request(path: path, method: "GET", cancellation: cancellation))
+    }
+
+    static func closeConnections(path: String, cancellation: CancellationSignal) throws {
+        _ = try responseBody(request(path: path, method: "DELETE", cancellation: cancellation), expectedStatus: "204")
+    }
+
+    private static func request(path: String, method: String, cancellation: CancellationSignal) throws -> Data {
         guard !cancellation.isCancelled() else { throw URLError(.cancelled) }
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
@@ -385,7 +414,7 @@ enum ClashController {
                 throw URLError(.cannotConnectToHost)
             }
         }
-        let request = Array("GET /connections HTTP/1.0\r\nHost: localhost\r\n\r\n".utf8)
+        let request = Array("\(method) /connections HTTP/1.0\r\nHost: localhost\r\n\r\n".utf8)
         var sent = 0
         while sent < request.count {
             try waitFor(Int16(POLLOUT))
@@ -400,7 +429,7 @@ enum ClashController {
         while true {
             try waitFor(Int16(POLLIN))
             let count = recv(descriptor, &buffer, buffer.count, 0)
-            if count == 0 { return try decodeResponse(response) }
+            if count == 0 { return response }
             if count < 0 {
                 if errno == EAGAIN || errno == EINTR { continue }
                 throw URLError(.networkConnectionLost)
@@ -421,6 +450,17 @@ enum ClashController {
     }
 }
 
+struct OutageClosePolicy {
+    private var attempted = false
+
+    mutating func shouldClose(for status: InternetStatus) -> Bool {
+        if status == .online { attempted = false }
+        guard status == .offline || status == .dnsStalled, !attempted else { return false }
+        attempted = true
+        return true
+    }
+}
+
 @MainActor
 final class ClashConnectivityMonitor {
     var onChange: ((InternetStatus) -> Void)?
@@ -434,6 +474,7 @@ final class ClashConnectivityMonitor {
     private var socketIdentity: UInt64?
     private let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.clash", qos: .utility)
     private var networkAvailable = true
+    private var outageClosePolicy = OutageClosePolicy()
 
     func start() {
         guard timer == nil else { return }
@@ -510,6 +551,13 @@ final class ClashConnectivityMonitor {
     private func publish(_ status: InternetStatus) {
         guard self.status != status else { return }
         self.status = status
+        if outageClosePolicy.shouldClose(for: status) {
+            let knownPath = socketPaths.first
+            queue.async {
+                guard let path = knownPath ?? ClashController.socketPaths().first else { return }
+                try? ClashController.closeConnections(path: path, cancellation: CancellationSignal())
+            }
+        }
         onChange?(status)
     }
 }
