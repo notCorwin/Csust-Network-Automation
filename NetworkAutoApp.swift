@@ -1052,25 +1052,6 @@ final class AutoLoginEngine: @unchecked Sendable {
     }
 }
 
-func updatePublishedAgo(_ date: Date, now: Date = Date()) -> String {
-    let elapsed = now.timeIntervalSince(date)
-    guard elapsed.isFinite, elapsed >= 10 else { return "刚刚" }
-    var remaining = elapsed >= TimeInterval(Int64.max) ? Int64.max : Int64(elapsed)
-    let units: [(Int64, String)] = [
-        (365 * 86400, "年"), (86400, "天"), (3600, "小时"), (60, "分钟"), (1, "秒")
-    ]
-    var parts: [String] = []
-    for (seconds, name) in units {
-        let count = remaining / seconds
-        if count > 0 {
-            parts.append("\(count) \(name)")
-            remaining %= seconds
-        }
-        if parts.count == 2 { break }
-    }
-    return parts.joined(separator: " ") + "前"
-}
-
 @MainActor
 final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = AppModel()
@@ -1081,24 +1062,16 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     @Published private(set) var permissionStatus: CLAuthorizationStatus
     @Published private(set) var networks: [WiFiNetwork] = []
     @Published private(set) var diagnosticText = ""
-    @Published private(set) var updateStatus = AppUpdateStatus.idle
-    @Published private var updateNow = Date()
 
     private let store: AppStore
-    private let updater = AppUpdater()
     private let locationManager = CLLocationManager()
     private let wifiMonitor = WiFiMonitor()
     private let engineSnapshot = EngineSnapshot()
     private let pathMonitor = NWPathMonitor()
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.path")
-    private var updateCheckTimer: Timer?
-    private var updateDisplayTimer: Timer?
-    private var lastUpdatePublishedAt: Date?
     private var connectivityTimer: Timer?
     private let internetMonitor = ClashConnectivityMonitor()
     private var started = false
-    private var isCheckingForUpdate = false
-    private var isInstallingUpdate = false
     private var manualCheckRequested = false
 
     private lazy var engine: AutoLoginEngine = {
@@ -1159,16 +1132,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             }
         }
         pathMonitor.start(queue: pathQueue)
-        let updateCheckTimer = Timer(timeInterval: 3 * 60, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.checkForUpdates(silently: true) }
-        }
-        RunLoop.main.add(updateCheckTimer, forMode: .common)
-        self.updateCheckTimer = updateCheckTimer
-        let updateDisplayTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.updateNow = Date() }
-        }
-        RunLoop.main.add(updateDisplayTimer, forMode: .common)
-        self.updateDisplayTimer = updateDisplayTimer
         let connectivityTimer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.requestCheck()
@@ -1190,10 +1153,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     func stop() {
-        updateCheckTimer?.invalidate()
-        updateCheckTimer = nil
-        updateDisplayTimer?.invalidate()
-        updateDisplayTimer = nil
         connectivityTimer?.invalidate()
         connectivityTimer = nil
         internetMonitor.stop()
@@ -1201,7 +1160,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         pathMonitor.cancel()
         wifiMonitor.stop()
         engine.stop()
-        updater.cancel()
     }
 
     func requestCheck() {
@@ -1254,84 +1212,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.locationManager.requestWhenInUseAuthorization()
         }
-    }
-
-    func checkForUpdatesNow() {
-        checkForUpdates(silently: false)
-    }
-
-    var updateMenuTitle: String {
-        if isInstallingUpdate { return "正在安装更新…" }
-        guard case .available = updateStatus, let lastUpdatePublishedAt else {
-            return updateStatus.title
-        }
-        return "\(updateStatus.title) · \(updatePublishedAgo(lastUpdatePublishedAt, now: updateNow))发布"
-    }
-
-    var updateActionEnabled: Bool {
-        !isInstallingUpdate && updateStatus.isInteractive
-    }
-
-    private func checkForUpdates(silently: Bool) {
-        guard !isCheckingForUpdate, !isInstallingUpdate else { return }
-        isCheckingForUpdate = true
-        updateStatus = .checking
-        updater.check { [weak self] result in
-            guard let self else { return }
-            isCheckingForUpdate = false
-
-            switch result {
-            case .success(let update):
-                lastUpdatePublishedAt = update?.publishedAt
-                guard let update else {
-                    updateStatus = .latest
-                    if !silently {
-                        showUpdateAlert(title: "已是最新版本", message: "当前已是最新版本。")
-                    }
-                    return
-                }
-                updateStatus = .available(String(update.revision.prefix(7)))
-                if !silently {
-                    presentUpdate(update)
-                }
-            case .failure(let error):
-                lastUpdatePublishedAt = nil
-                updateStatus = .failed
-                if !silently {
-                    showUpdateAlert(title: "检查更新失败", message: error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    private func presentUpdate(_ update: AppUpdate) {
-        let alert = NSAlert()
-        alert.messageText = "发现 Csust-Network-Automation 新版本"
-        let revision = update.revision == "unknown"
-            ? ""
-            : "\n构建提交：\(update.revision.prefix(7))"
-        alert.informativeText = "\(update.name)\(revision)\n是否下载并安装？"
-        alert.addButton(withTitle: "更新")
-        alert.addButton(withTitle: "稍后")
-        let choice = runFocusedAlert(alert)
-        guard choice == .alertFirstButtonReturn else { return }
-
-        isInstallingUpdate = true
-        updater.downloadAndInstall(update) { [weak self] result in
-            guard let self else { return }
-            if case .failure(let error) = result {
-                isInstallingUpdate = false
-                showUpdateAlert(title: "安装更新失败", message: error.localizedDescription)
-            }
-        }
-    }
-
-    private func showUpdateAlert(title: String, message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: "好")
-        runFocusedAlert(alert)
     }
 
     var statusText: String {
@@ -1485,7 +1365,6 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private var animationTimer: Timer?
     private var campusItem: NSMenuItem?
     private var internetItem: NSMenuItem?
-    private var updateItem: NSMenuItem?
     private var online: Bool
 
     init(model: AppModel) {
@@ -1594,8 +1473,6 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         campusItem?.toolTip = model.statusText
         internetItem?.title = "互联网：\(model.internetStatus.title)"
         internetItem?.toolTip = model.internetStatus.detail
-        updateItem?.title = model.updateMenuTitle
-        updateItem?.isEnabled = model.updateActionEnabled
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -1617,8 +1494,6 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         action("立即登录校园网", #selector(checkNow))
         menu.addItem(.separator())
-        updateItem = action(model.updateMenuTitle, #selector(checkForUpdates))
-        updateItem?.isEnabled = model.updateActionEnabled
         action("设置", #selector(openSettings))
         action("退出", #selector(quit))
         refreshMenu()
@@ -1626,7 +1501,6 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func checkNow() { model.checkNow() }
     @objc private func openSettings() { (NSApp.delegate as? AppDelegate)?.openSettingsWindow() }
-    @objc private func checkForUpdates() { model.checkForUpdatesNow() }
     @objc private func quit() { model.quit() }
 }
 
@@ -1774,14 +1648,13 @@ enum SelfTest {
         statusBar.verifyStableIdentity()
         let menu = NSMenu()
         statusBar.menuNeedsUpdate(menu)
-        precondition(menu.items.count == 8)
+        precondition(menu.items.count == 7)
         precondition(menu.items[0].title.hasPrefix("校园网："))
         precondition(menu.items[1].title.hasPrefix("互联网："))
         precondition(menu.items[2].isSeparatorItem && menu.items[4].isSeparatorItem)
         precondition(menu.items[3].title == "立即登录校园网" && menu.items[3].isEnabled)
-        precondition(menu.items[5].title == "检查更新" && menu.items[5].isEnabled)
-        precondition(menu.items[6].title == "设置" && menu.items[6].isEnabled)
-        precondition(menu.items[7].title == "退出" && menu.items[7].isEnabled)
+        precondition(menu.items[5].title == "设置" && menu.items[5].isEnabled)
+        precondition(menu.items[6].title == "退出" && menu.items[6].isEnabled)
         (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
         precondition(NSApp.activationPolicy() == .accessory)
         statusBar.stop()
@@ -1823,10 +1696,6 @@ enum SelfTest {
         var changedConfig = config
         changedConfig.password = "different"
         precondition(configFingerprint(config) != configFingerprint(changedConfig))
-        precondition(AppUpdateStatus.latest.title == "检查更新")
-        precondition(AppUpdateStatus.failed.title == "检查更新")
-        precondition(updatePublishedAgo(Date(timeIntervalSince1970: 0), now: Date(timeIntervalSince1970: 438)) == "7 分钟 18 秒前")
-        updateParsing()
         storeMigrationAndPersistence()
         engineCancellationAndMutex()
         manualLoginBypassesConnectivity()
@@ -1834,60 +1703,6 @@ enum SelfTest {
         httpLogin(proxy: false)
         httpLogin(proxy: true)
         print("NetworkAuto self-test passed")
-    }
-
-    private static func updateParsing() {
-        let revision = String(repeating: "a", count: 40)
-        let digest = String(repeating: "0", count: 64)
-        let data = Data(
-            """
-            {
-              "name": "autobuild",
-              "published_at": "2026-09-07T00:00:00Z",
-              "target_commitish": "\(revision)",
-              "body": "",
-              "assets": [{
-                "name": "NetworkAuto.app.tar",
-                "browser_download_url": "https://github.com/notCorwin/Csust-Network-Automation/releases/download/autobuild/NetworkAuto.app.tar",
-                "digest": "sha256:\(digest)"
-              }]
-            }
-            """.utf8
-        )
-        precondition(AppUpdater.revision(in: "commit \(revision)") == revision)
-        precondition(
-            AppUpdater.archiveAppRoot(
-                from: "NetworkAuto.app/Contents/MacOS/NetworkAuto"
-            ) == "NetworkAuto.app"
-        )
-        precondition(
-            AppUpdater.archiveAppRoot(from: "../NetworkAuto.app/Contents") == nil
-        )
-        precondition(
-            AppUpdater.archiveContainsUnsafeEntry(
-                in: "lrwxr-xr-x  0 user  wheel  0 Jan 1 00:00 Link -> /tmp"
-            )
-        )
-        precondition(
-            !AppUpdater.archiveExceedsSizeLimit(
-                in: "-rw-r--r--  0 user  wheel  268435456 Jan 1 00:00 file"
-            )
-        )
-        guard case .success(let update) = AppUpdater.parse(data: data, currentRevision: "development"),
-              let update else {
-            preconditionFailure("release metadata must parse")
-        }
-        precondition(update.revision == revision)
-        precondition(update.expectedSHA256 == digest)
-        precondition(update.publishedAt == Date(timeIntervalSince1970: 1_788_739_200))
-        guard case .success(nil) = AppUpdater.parse(data: data, currentRevision: revision) else {
-            preconditionFailure("same revision must not update")
-        }
-        let missingDigest = Data(String(decoding: data, as: UTF8.self)
-            .replacingOccurrences(of: "\"digest\": \"sha256:\(digest)\"", with: "\"digest\": null").utf8)
-        guard case .failure(.invalidResponse) = AppUpdater.parse(data: missingDigest, currentRevision: "development") else {
-            preconditionFailure("release without SHA-256 must be rejected")
-        }
     }
 
     private static func storeMigrationAndPersistence() {

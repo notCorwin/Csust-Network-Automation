@@ -158,11 +158,14 @@ enum ClashConnectivitySelfTest {
         precondition(!snapshotState.read().internetConnected)
         dnsStalls()
         var closePolicy = OutageClosePolicy()
-        precondition(closePolicy.shouldClose(for: .dnsStalled))
-        precondition(!closePolicy.shouldClose(for: .unknown))
-        precondition(!closePolicy.shouldClose(for: .offline))
-        precondition(!closePolicy.shouldClose(for: .online))
-        precondition(closePolicy.shouldClose(for: .offline))
+        precondition(closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: true))
+        precondition(closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: true))
+        precondition(!closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: false))
+        precondition(!closePolicy.shouldClose(for: .unknown, fromSnapshot: true))
+        precondition(closePolicy.shouldClose(for: .offline, fromSnapshot: false))
+        precondition(!closePolicy.shouldClose(for: .offline, fromSnapshot: false))
+        precondition(!closePolicy.shouldClose(for: .online, fromSnapshot: true))
+        precondition(closePolicy.shouldClose(for: .offline, fromSnapshot: false))
         ipcSnapshot()
     }
 
@@ -453,9 +456,10 @@ enum ClashController {
 struct OutageClosePolicy {
     private var attempted = false
 
-    mutating func shouldClose(for status: InternetStatus) -> Bool {
+    mutating func shouldClose(for status: InternetStatus, fromSnapshot: Bool) -> Bool {
+        if status == .dnsStalled { return fromSnapshot }
         if status == .online { attempted = false }
-        guard status == .offline || status == .dnsStalled, !attempted else { return false }
+        guard status == .offline, !attempted else { return false }
         attempted = true
         return true
     }
@@ -526,7 +530,11 @@ final class ClashConnectivityMonitor {
                 self.request = nil
                 switch result {
                 case .success(let snapshot):
-                    self.publish(self.evidence.observe(snapshot, now: ProcessInfo.processInfo.systemUptime))
+                    let status = self.evidence.observe(snapshot, now: ProcessInfo.processInfo.systemUptime)
+                    if self.outageClosePolicy.shouldClose(for: status, fromSnapshot: true) {
+                        self.closeConnections(path: socketPath)
+                    }
+                    self.publish(status)
                 case .failure: self.failed()
                 }
             }
@@ -551,13 +559,16 @@ final class ClashConnectivityMonitor {
     private func publish(_ status: InternetStatus) {
         guard self.status != status else { return }
         self.status = status
-        if outageClosePolicy.shouldClose(for: status) {
-            let knownPath = socketPaths.first
-            queue.async {
-                guard let path = knownPath ?? ClashController.socketPaths().first else { return }
-                try? ClashController.closeConnections(path: path, cancellation: CancellationSignal())
-            }
+        if outageClosePolicy.shouldClose(for: status, fromSnapshot: false) {
+            closeConnections(path: socketPaths.first)
         }
         onChange?(status)
+    }
+
+    private func closeConnections(path: String?) {
+        queue.async {
+            guard let path = path ?? ClashController.socketPaths().first else { return }
+            try? ClashController.closeConnections(path: path, cancellation: CancellationSignal())
+        }
     }
 }
