@@ -1378,7 +1378,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     private func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        Task {
+            _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+        }
     }
 
     private func registerLaunchAtLogin() {
