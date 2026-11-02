@@ -1148,6 +1148,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             guard let self else { return }
             self.internetStatus = status
             self.engineSnapshot.updateConnectivity(status.isConnected)
+            if status == .dnsStalled { self.engine.request() }
         }
         internetMonitor.start()
         pathMonitor.pathUpdateHandler = { [weak self] path in
