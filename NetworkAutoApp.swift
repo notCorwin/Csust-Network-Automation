@@ -1355,6 +1355,18 @@ private final class SettingsWindowController: NSWindowController {
 }
 
 @MainActor
+private func removeStatusItemPreservingPosition(_ item: NSStatusItem) {
+    guard let name = item.autosaveName else {
+        NSStatusBar.system.removeStatusItem(item)
+        return
+    }
+    let key = "NSStatusItem Preferred Position \(name)"
+    let position = UserDefaults.standard.object(forKey: key)
+    NSStatusBar.system.removeStatusItem(item)
+    if let position { UserDefaults.standard.set(position, forKey: key) }
+}
+
+@MainActor
 private final class StatusBarController: NSObject, NSMenuDelegate {
     private let model: AppModel
     private let item = NSStatusBar.system.statusItem(withLength: 28)
@@ -1412,7 +1424,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         timer?.invalidate()
         animationTimer?.invalidate()
         connectivitySubscription?.cancel()
-        NSStatusBar.system.removeStatusItem(item)
+        removeStatusItemPreservingPosition(item)
     }
 
     private func symbol(_ name: String) -> NSImage {
@@ -1644,6 +1656,14 @@ private final class LockedAppState: @unchecked Sendable {
 enum SelfTest {
     @MainActor
     static func run() {
+        let testItem = NSStatusBar.system.statusItem(withLength: 28)
+        let testName = "NetworkAuto-test-\(UUID().uuidString)"
+        testItem.autosaveName = NSStatusItem.AutosaveName(testName)
+        let positionKey = "NSStatusItem Preferred Position \(testName)"
+        UserDefaults.standard.set(123, forKey: positionKey)
+        removeStatusItemPreservingPosition(testItem)
+        precondition(UserDefaults.standard.integer(forKey: positionKey) == 123)
+        UserDefaults.standard.removeObject(forKey: positionKey)
         let statusBar = StatusBarController(model: .shared)
         statusBar.verifyStableIdentity()
         let menu = NSMenu()
