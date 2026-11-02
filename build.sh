@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 APP_PATH="$(pwd)/target/NetworkAuto.app"
 EXECUTABLE="$APP_PATH/Contents/MacOS/NetworkAuto"
 APP_REVISION="${APP_REVISION:-development}"
+BUNDLE_ID="com.nowaywastaken.csustautologin"
 
 echo "🔨 正在编译 Csust-Network-Automation App..."
 rm -rf "$APP_PATH"
@@ -31,9 +32,10 @@ swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
   -framework UserNotifications \
   -o "$EXECUTABLE" NetworkAutoApp.swift AppUpdater.swift ClashConnectivity.swift
 cp Info.plist "$APP_PATH/Contents/Info.plist"
+[[ "$(plutil -extract CFBundleIdentifier raw -o - "$APP_PATH/Contents/Info.plist")" == "$BUNDLE_ID" ]]
 cp Assets/NetworkAuto.icns "$APP_PATH/Contents/Resources/NetworkAuto.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleSourceRevision $APP_REVISION" "$APP_PATH/Contents/Info.plist"
-codesign --force --deep --sign - "$APP_PATH" >/dev/null
+codesign --force --deep --identifier "$BUNDLE_ID" --sign - "$APP_PATH" >/dev/null
 codesign --verify --deep --strict "$APP_PATH"
 
 "$EXECUTABLE" --self-test

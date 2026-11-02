@@ -1492,6 +1492,8 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         super.init()
         item.autosaveName = "NetworkAuto"
         guard let button = item.button else { return }
+        // Ice identifies status items by bundle identifier and window title.
+        button.window?.title = "NetworkAuto"
         button.image = nil
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.imageScaling = .scaleProportionallyUpOrDown
@@ -1513,6 +1515,16 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
             self?.setConnectivity(status.isConnected)
             self?.item.button?.setAccessibilityLabel("互联网：\(status.title)")
         }
+    }
+
+    func verifyStableIdentity() {
+        guard let window = item.button?.window else { preconditionFailure("Status item has no window") }
+        precondition(item.autosaveName == "NetworkAuto" && window.title == "NetworkAuto")
+        let original = online
+        setConnectivity(!original)
+        precondition(window.title == "NetworkAuto")
+        setConnectivity(original)
+        precondition(window.title == "NetworkAuto")
     }
 
     func stop() {
@@ -1757,6 +1769,7 @@ enum SelfTest {
     @MainActor
     static func run() {
         let statusBar = StatusBarController(model: .shared)
+        statusBar.verifyStableIdentity()
         let menu = NSMenu()
         statusBar.menuNeedsUpdate(menu)
         precondition(menu.items.count == 8)
