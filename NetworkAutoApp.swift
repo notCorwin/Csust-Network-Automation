@@ -489,6 +489,89 @@ final class WiFiMonitor: NSObject, CWEventDelegate {
     func clientConnectionInvalidated() { onChange?() }
 }
 
+// Association is separate from portal authentication: never replace an existing Wi-Fi link.
+func shouldRecoverWiFi(networks: [WiFiNetwork], permissionAuthorized: Bool, internetConnected: Bool) -> Bool {
+    permissionAuthorized && !internetConnected && !networks.contains {
+        $0.ssid != nil || $0.bssid != nil || $0.ip != nil
+    }
+}
+
+@MainActor
+final class WiFiRecovery {
+    private let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.wifi-recovery", qos: .utility)
+    private var inFlight = false
+    private var nextAttempt = ContinuousClock.now
+    private var cancellation = CancellationSignal()
+    var onUpdate: ((String) -> Void)?
+
+    func cancel() {
+        cancellation.cancel()
+    }
+
+    func request(snapshot: EngineSnapshot) {
+        let current = snapshot.read()
+        guard !inFlight, ContinuousClock.now >= nextAttempt,
+              shouldRecoverWiFi(networks: current.networks, permissionAuthorized: current.permissionAuthorized,
+                                internetConnected: current.internetConnected) else { return }
+        inFlight = true
+        cancellation = CancellationSignal()
+        let cancellation = cancellation
+        onUpdate?("正在查找并连接校园 Wi-Fi…")
+        queue.async { [weak self] in
+            let stillNeeded: @Sendable () -> Bool = {
+                let current = snapshot.read()
+                return !cancellation.isCancelled() && shouldRecoverWiFi(
+                    networks: current.networks, permissionAuthorized: current.permissionAuthorized,
+                    internetConnected: current.internetConnected
+                )
+            }
+            let detail = Self.connect(stillNeeded: stillNeeded)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.inFlight = false
+                // Scan failures and missing APs must not create an event-driven busy loop.
+                self.nextAttempt = cancellation.isCancelled() ? .now : .now.advanced(by: .seconds(15))
+                guard !cancellation.isCancelled(), let detail else { return }
+                self.onUpdate?(detail)
+            }
+        }
+    }
+
+    nonisolated private static func connect(stillNeeded: @Sendable () -> Bool) -> String? {
+        guard stillNeeded() else { return nil }
+        let client = CWWiFiClient()
+        let interfaces = client.interfaces() ?? []
+        guard !interfaces.isEmpty else { return "未找到 Wi-Fi 接口，请检查系统网络设置。" }
+        func hasConnection() -> Bool {
+            interfaces.contains { $0.ssid() != nil || $0.bssid() != nil }
+        }
+        var failures: [String] = []
+        for interface in interfaces {
+            guard stillNeeded(), !hasConnection() else { return nil }
+            do {
+                if !interface.powerOn() { try interface.setPower(true) }
+                guard stillNeeded(), !hasConnection() else { return nil }
+                let candidates = try interface.scanForNetworks(withSSID: Data(campusSSID.utf8))
+                    .filter { $0.ssid == campusSSID && $0.supportsSecurity(.none) && !$0.ibss }
+                    .sorted { $0.rssiValue > $1.rssiValue }
+                for network in candidates {
+                    guard stillNeeded(), !hasConnection() else { return nil }
+                    do {
+                        try interface.associate(to: network, password: nil)
+                        return "已连接校园 Wi-Fi，正在检查校园网登录。"
+                    } catch {
+                        failures.append("连接失败：\(error.localizedDescription)")
+                    }
+                }
+            } catch {
+                failures.append("Wi-Fi 操作失败：\(error.localizedDescription)")
+            }
+        }
+        if failures.isEmpty { return "未发现可连接的 CSUST-Student，将在下次检查时重试。" }
+        return "\(failures.last!)；将自动重试。若持续失败，请检查系统 Wi-Fi 设置与定位权限。"
+    }
+}
+
 enum AuthOutcome: Equatable {
     case online
     case credentials
@@ -1066,6 +1149,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let store: AppStore
     private let locationManager = CLLocationManager()
     private let wifiMonitor = WiFiMonitor()
+    private let wifiRecovery = WiFiRecovery()
+    private var networkSleeping = false
+    private var networkPathReady = false
+    private var wifiRecoveryDetail = ""
     private let engineSnapshot = EngineSnapshot()
     private let pathMonitor = NWPathMonitor()
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.networkauto.path")
@@ -1110,6 +1197,13 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         requestNotificationPermission()
         registerLaunchAtLogin()
 
+        wifiRecovery.onUpdate = { [weak self] detail in
+            guard let self else { return }
+            self.wifiRecoveryDetail = detail
+            self.diagnosticText = detail
+            self.refreshNetworks()
+            self.engine.request()
+        }
         wifiMonitor.onChange = { [weak self] in
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
@@ -1122,10 +1216,12 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             self.internetStatus = status
             self.engineSnapshot.updateConnectivity(status.isConnected)
             if status == .dnsStalled { self.engine.request() }
+            self.recoverWiFiIfNeeded()
         }
         internetMonitor.start()
         pathMonitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor [weak self] in
+                self?.networkPathReady = true
                 self?.engineSnapshot.invalidateNetwork()
                 self?.internetMonitor.reset(networkAvailable: path.status == .satisfied)
                 self?.requestCheck()
@@ -1153,26 +1249,42 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     func stop() {
+        started = false
         connectivityTimer?.invalidate()
         connectivityTimer = nil
         internetMonitor.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         pathMonitor.cancel()
+        wifiRecovery.cancel()
         wifiMonitor.stop()
         engine.stop()
     }
 
     func requestCheck() {
         refreshNetworks()
+        recoverWiFiIfNeeded()
         engine.request()
     }
 
+    private func recoverWiFiIfNeeded() {
+        guard started, networkPathReady, !networkSleeping else { return }
+        let path = pathMonitor.currentPath
+        if path.status == .satisfied && path.usesInterfaceType(.wiredEthernet) {
+            wifiRecovery.cancel()
+            return
+        }
+        wifiRecovery.request(snapshot: engineSnapshot)
+    }
+
     @objc private func networkWillSleep(_ notification: Notification) {
+        networkSleeping = true
+        wifiRecovery.cancel()
         engineSnapshot.invalidateNetwork()
         internetMonitor.reset(networkAvailable: false)
     }
 
     @objc private func networkDidWake(_ notification: Notification) {
+        networkSleeping = false
         engineSnapshot.invalidateNetwork()
         internetMonitor.reset(networkAvailable: pathMonitor.currentPath.status == .satisfied)
         requestCheck()
@@ -1182,6 +1294,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         manualCheckRequested = true
         diagnosticText = "正在检查…"
         refreshNetworks()
+        recoverWiFiIfNeeded()
         engine.checkNow()
     }
 
@@ -1222,6 +1335,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             default: return "需要定位权限"
             }
         }
+        if state.phase == "outside", !wifiRecoveryDetail.isEmpty { return wifiRecoveryDetail }
         if state.checking {
             return "正在检查…"
         }
@@ -1251,6 +1365,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         let refreshed = wifiMonitor.networks()
         if networks != refreshed { internetMonitor.reset() }
         networks = refreshed
+        if refreshed.contains(where: { $0.ssid != nil || $0.bssid != nil || $0.ip != nil }) {
+            wifiRecoveryDetail = ""
+            wifiRecovery.cancel()
+        }
         engineSnapshot.update(
             networks: networks,
             permissionAuthorized: isLocationAuthorized
@@ -1678,6 +1796,11 @@ enum SelfTest {
         (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
         precondition(NSApp.activationPolicy() == .accessory)
         statusBar.stop()
+        runHeadless()
+    }
+
+    static func runHeadless() {
+        wifiRecoveryPolicy()
         precondition(!usableIPv4("127.0.0.1"))
         precondition(!usableIPv4("169.254.1.1"))
         precondition(usableIPv4("10.183.0.2"))
@@ -1723,6 +1846,22 @@ enum SelfTest {
         httpLogin(proxy: false)
         httpLogin(proxy: true)
         print("NetworkAuto self-test passed")
+    }
+
+    private static func wifiRecoveryPolicy() {
+        let disconnected = WiFiNetwork(interfaceName: "en0", ssid: nil, bssid: nil, ip: nil)
+        precondition(shouldRecoverWiFi(networks: [disconnected], permissionAuthorized: true, internetConnected: false))
+        precondition(!shouldRecoverWiFi(networks: [disconnected], permissionAuthorized: false, internetConnected: false))
+        precondition(!shouldRecoverWiFi(networks: [disconnected], permissionAuthorized: true, internetConnected: true))
+        // A hidden SSID, a pending DHCP lease, or a second associated adapter must prevent takeover.
+        for connected in [
+            WiFiNetwork(interfaceName: "en1", ssid: "other", bssid: nil, ip: nil),
+            WiFiNetwork(interfaceName: "en1", ssid: nil, bssid: "aa", ip: nil),
+            WiFiNetwork(interfaceName: "en1", ssid: nil, bssid: nil, ip: "192.0.2.1"),
+            WiFiNetwork(interfaceName: "en1", ssid: campusSSID, bssid: "aa", ip: nil)
+        ] {
+            precondition(!shouldRecoverWiFi(networks: [disconnected, connected], permissionAuthorized: true, internetConnected: false))
+        }
     }
 
     private static func storeMigrationAndPersistence() {
@@ -1983,6 +2122,10 @@ enum SelfTest {
 @main
 enum NetworkAutoApp {
     @MainActor static func main() {
+        if CommandLine.arguments.contains("--headless-self-test") {
+            SelfTest.runHeadless()
+            return
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

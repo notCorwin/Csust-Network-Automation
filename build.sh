@@ -36,7 +36,7 @@ cp Assets/NetworkAuto.icns "$APP_PATH/Contents/Resources/NetworkAuto.icns"
 codesign --force --deep --identifier "$BUNDLE_ID" --sign - "$APP_PATH" >/dev/null
 codesign --verify --deep --strict "$APP_PATH"
 
-"$EXECUTABLE" --self-test
+"$EXECUTABLE" --headless-self-test
 bash install.sh self-test
 
 echo ""
