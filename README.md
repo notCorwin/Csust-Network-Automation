@@ -1,3 +1,5 @@
+![校园网自动登录与网络监测流程](Assets/network-automation-flow.png)
+
 # Csust-Network-Automation
 
 [![macOS 构建](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/notCorwin/Csust-Network-Automation/actions/workflows/release.yml)
