@@ -31,6 +31,6 @@
 
 1. 通过 GitHub Actions 和 Releases 实现检查更新功能。
 2. 每次做出改动后，自动提交并推送。
-3. 只使用 AppKit/UIKit App，弃用 SwiftUI。
+3. 只使用 AppKit，弃用 SwiftUI。
 4. 弃用 Keychain。
 5. 设置页只设置账号和密码，其他都写进代码里。
