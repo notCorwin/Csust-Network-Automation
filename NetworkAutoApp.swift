@@ -7,6 +7,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import Network
+import ObjectiveC
 import ServiceManagement
 import Symbols
 import UserNotifications
@@ -486,6 +487,34 @@ final class WiFiMonitor: NSObject, CWEventDelegate {
         return result
     }
 
+    // CoreWLAN does not expose this flag publicly. Treat an unavailable or
+    // ambiguous saved profile as unknown and never use it to control Wi-Fi.
+    static func personalHotspotProfile(networks: [WiFiNetwork]) -> Bool? {
+        let client = CWWiFiClient()
+        let selector = NSSelectorFromString("isPersonalHotspot")
+        let linked = networks.filter { $0.ssid != nil || $0.bssid != nil || $0.ip != nil }
+        guard linked.count == 1 else { return nil }
+        var results: [Bool] = []
+        for network in linked {
+            guard let ssid = network.ssid, ssid != campusSSID, network.bssid != nil,
+                  let interface = client.interface(withName: network.interfaceName),
+                  let profiles = interface.configuration()?.networkProfiles else { continue }
+            let matching = profiles.compactMap { $0 as? CWNetworkProfile }.filter { $0.ssid == ssid }
+            guard matching.count == 1, let profile = matching.first,
+                  profile.responds(to: selector),
+                  let method = class_getInstanceMethod(type(of: profile), selector),
+                  method_getNumberOfArguments(method) == 2 else { continue }
+            let returnType = method_copyReturnType(method)
+            defer { free(returnType) }
+            guard String(cString: returnType) == "B" || String(cString: returnType) == "c" else { continue }
+            typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
+            let getter = unsafeBitCast(method_getImplementation(method), to: Getter.self)
+            results.append(getter(profile, selector))
+        }
+        guard results.count == 1 else { return nil }
+        return results[0]
+    }
+
     func ssidDidChangeForWiFiInterface(withName interfaceName: String) { onChange?() }
     func bssidDidChangeForWiFiInterface(withName interfaceName: String) { onChange?() }
     func linkDidChangeForWiFiInterface(withName interfaceName: String) { onChange?() }
@@ -509,16 +538,66 @@ func verifiedHotspotSSID(_ ssid: String?, bssid: String?, networks: [WiFiNetwork
     return ssid
 }
 
+// A prior confirmation is useful across launches only while both live identifiers
+// still match. Keep this bounded: network names and access points can be reused.
+struct ConfirmedHotspot: Codable, Equatable {
+    let ssid: String
+    let bssid: String
+    let confirmedAt: Date
+}
+
+final class HotspotIdentityCache {
+    private let defaults: UserDefaults
+    private let key = "confirmedHotspot.v1"
+    private let lifetime: TimeInterval = 30 * 24 * 60 * 60
+    private var saved: ConfirmedHotspot?
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let data = defaults.data(forKey: key) { saved = try? JSONDecoder().decode(ConfirmedHotspot.self, from: data) }
+    }
+
+    func remember(ssid: String, bssid: String, now: Date = Date()) {
+        let identity = ConfirmedHotspot(ssid: ssid, bssid: bssid, confirmedAt: now)
+        guard !ssid.isEmpty, !bssid.isEmpty, let data = try? JSONEncoder().encode(identity) else { return }
+        saved = identity
+        defaults.set(data, forKey: key)
+    }
+
+    func matching(networks: [WiFiNetwork], now: Date = Date()) -> ConfirmedHotspot? {
+        guard let saved else { return nil }
+        guard !saved.ssid.isEmpty, !saved.bssid.isEmpty,
+              now >= saved.confirmedAt, now.timeIntervalSince(saved.confirmedAt) < lifetime else {
+            self.saved = nil
+            defaults.removeObject(forKey: key)
+            return nil
+        }
+        guard networks.contains(where: { $0.ssid == saved.ssid && $0.bssid == saved.bssid && $0.ip != nil }) else { return nil }
+        return saved
+    }
+}
+
 enum WiFiControlIssue {
     case occupied, unavailable
 }
 
+func hotspotRecognition(profile: Bool?, cachedMatch: Bool) -> Bool? {
+    profile ?? (cachedMatch ? true : nil)
+}
+
+func acceptsHotspotProfileResult(token: UInt, currentToken: UInt, authorized: Bool,
+                                 queried: [WiFiNetwork], current: [WiFiNetwork]) -> Bool {
+    token == currentToken && authorized && queried == current
+}
+
 func personalHotspotStatus(networks: [WiFiNetwork], permissionAuthorized: Bool,
                            ownedSSID: String?, ownedBSSID: String?, sleeping: Bool,
-                           controlIssue: WiFiControlIssue?, phase: HotspotPhase) -> String {
+                           controlIssue: WiFiControlIssue?, phase: HotspotPhase,
+                           recognizedHotspot: Bool? = nil) -> String {
     if sleeping { return "已暂停" }
     guard permissionAuthorized else { return "需要定位权限" }
     if verifiedHotspotSSID(ownedSSID, bssid: ownedBSSID, networks: networks) != nil { return "已连接" }
+    if recognizedHotspot == true { return "已连接" }
     if controlIssue == .occupied { return "其他应用占用" }
     if controlIssue == .unavailable { return "控制权获取失败" }
     switch phase {
@@ -530,6 +609,7 @@ func personalHotspotStatus(networks: [WiFiNetwork], permissionAuthorized: Bool,
     case .suspended: return "已暂停"
     case .disabled, .networkAvailable: break
     }
+    if recognizedHotspot == false { return "未连接" }
     if networks.contains(where: { ($0.ssid != nil && $0.ssid != campusSSID) || ($0.ssid == nil && $0.bssid != nil) }) {
         return "无法识别"
     }
@@ -1224,9 +1304,13 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private var ownsWiFiControl = false
     private var wifiControlIssue: WiFiControlIssue?
     private let hotspot = HotspotController(discovery: RemoteHotspotDiscovery(), joiner: WiFiJoiner())
+    private let hotspotIdentityCache = HotspotIdentityCache()
     private var ownedHotspotSSID: String?
     private var ownedHotspotBSSID: String?
     private var pendingHotspotSSID: String?
+    private var profileRecognizesHotspot: Bool?
+    private var profileLookupGeneration: UInt = 0
+    private var profileLookupTime: ContinuousClock.Instant?
     private var campusAssociationFailures = 0
     private var fallbackUntil: ContinuousClock.Instant?
     private var campusSearchTask: Task<Void, Never>?
@@ -1567,7 +1651,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
                               ownedSSID: ownedHotspotSSID, ownedBSSID: ownedHotspotBSSID,
                               sleeping: networkSleeping,
                               controlIssue: wifiControlIssue,
-                              phase: hotspot.phase)
+                              phase: hotspot.phase,
+                              recognizedHotspot: hotspotRecognition(profile: profileRecognizesHotspot,
+                                                                   cachedMatch: hotspotIdentityCache.matching(networks: networks) != nil))
     }
 
     var personalHotspotDetail: String {
@@ -1608,9 +1694,30 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
            pathMonitor.currentPath.usesInterfaceType(.wifi) {
             ownedHotspotSSID = pending
             ownedHotspotBSSID = connected.bssid
+            if let bssid = connected.bssid { hotspotIdentityCache.remember(ssid: pending, bssid: bssid) }
             hotspot.networkAvailable(true)
         }
         let networkChanged = networks != refreshed
+        if networkChanged {
+            profileRecognizesHotspot = nil
+            profileLookupTime = nil
+            profileLookupGeneration &+= 1
+        }
+        if isLocationAuthorized, profileLookupTime.map({ ContinuousClock.now - $0 >= .seconds(30) }) ?? true {
+            profileLookupTime = ContinuousClock.now
+            profileLookupGeneration &+= 1
+            let token = profileLookupGeneration
+            Task { @MainActor [weak self] in
+                let result = await Task.detached {
+                    WiFiMonitor.personalHotspotProfile(networks: refreshed)
+                }.value
+                guard let self, acceptsHotspotProfileResult(token: token, currentToken: self.profileLookupGeneration,
+                                                           authorized: self.isLocationAuthorized,
+                                                           queried: refreshed, current: self.networks) else { return }
+                self.profileRecognizesHotspot = result
+                self.objectWillChange.send()
+            }
+        }
         if networkChanged { internetMonitor.reset() }
         networks = refreshed
         if !maySelectCampus(networks: refreshed, permissionAuthorized: isLocationAuthorized, ownedHotspotSSID: verifiedHotspotSSID(ownedHotspotSSID, bssid: ownedHotspotBSSID, networks: refreshed)) {
@@ -2135,6 +2242,22 @@ enum SelfTest {
         precondition(hotspotStatus([hotspot], ssid: "Phone", bssid: "bb") == "已连接")
         precondition(hotspotStatus([hotspot], ssid: "Phone", bssid: "other") == "无法识别")
         precondition(hotspotStatus([hotspot]) == "无法识别")
+        precondition(personalHotspotStatus(networks: [hotspot], permissionAuthorized: true,
+                                          ownedSSID: nil, ownedBSSID: nil, sleeping: false,
+                                          controlIssue: nil, phase: .disabled, recognizedHotspot: true) == "已连接")
+        precondition(personalHotspotStatus(networks: [hotspot], permissionAuthorized: false,
+                                          ownedSSID: nil, ownedBSSID: nil, sleeping: false,
+                                          controlIssue: nil, phase: .disabled, recognizedHotspot: true) == "需要定位权限")
+        precondition(hotspotRecognition(profile: false, cachedMatch: true) == false)
+        precondition(hotspotRecognition(profile: nil, cachedMatch: true) == true)
+        precondition(hotspotRecognition(profile: nil, cachedMatch: false) == nil)
+        precondition(personalHotspotStatus(networks: [hotspot], permissionAuthorized: true,
+                                          ownedSSID: nil, ownedBSSID: nil, sleeping: false,
+                                          controlIssue: nil, phase: .disabled, recognizedHotspot: false) == "未连接")
+        precondition(acceptsHotspotProfileResult(token: 1, currentToken: 1, authorized: true, queried: [hotspot], current: [hotspot]))
+        precondition(!acceptsHotspotProfileResult(token: 1, currentToken: 2, authorized: true, queried: [hotspot], current: [hotspot]))
+        precondition(!acceptsHotspotProfileResult(token: 1, currentToken: 1, authorized: false, queried: [hotspot], current: [hotspot]))
+        precondition(!acceptsHotspotProfileResult(token: 1, currentToken: 1, authorized: true, queried: [hotspot], current: [disconnected]))
         precondition(hotspotStatus([hotspot], authorized: false) == "需要定位权限")
         precondition(hotspotStatus([disconnected]) == "未连接")
         precondition(hotspotStatus([hotspot], ssid: "Phone", bssid: "bb", sleeping: true) == "已暂停")
@@ -2150,6 +2273,17 @@ enum SelfTest {
         precondition(verifiedHotspotSSID("Phone", bssid: "bb", networks: [hotspot]) == "Phone")
         precondition(verifiedHotspotSSID("Phone", bssid: "bb", networks: [disconnected]) == nil)
         precondition(verifiedHotspotSSID("Phone", bssid: "different", networks: [hotspot]) == nil)
+        let suiteName = "HotspotIdentityCacheSelfTest.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cache = HotspotIdentityCache(defaults: defaults)
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        cache.remember(ssid: "Phone", bssid: "bb", now: now)
+        precondition(cache.matching(networks: [hotspot], now: now)?.ssid == "Phone")
+        precondition(HotspotIdentityCache(defaults: defaults).matching(networks: [hotspot], now: now)?.ssid == "Phone")
+        precondition(cache.matching(networks: [WiFiNetwork(interfaceName: "en0", ssid: "Phone", bssid: "cc", ip: "192.0.2.2")], now: now) == nil)
+        precondition(cache.matching(networks: [disconnected], now: now) == nil)
+        precondition(cache.matching(networks: [hotspot], now: now.addingTimeInterval(30 * 24 * 60 * 60)) == nil)
         precondition(!maySelectCampus(networks: [hotspot], permissionAuthorized: false, ownedHotspotSSID: "Phone"))
         precondition(!maySelectCampus(networks: [hotspot], permissionAuthorized: true, ownedHotspotSSID: nil))
         precondition(!maySelectCampus(networks: [hotspot, WiFiNetwork(interfaceName: "en1", ssid: "Other", bssid: "cc", ip: nil)], permissionAuthorized: true, ownedHotspotSSID: "Phone"))
