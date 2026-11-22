@@ -509,6 +509,33 @@ func verifiedHotspotSSID(_ ssid: String?, bssid: String?, networks: [WiFiNetwork
     return ssid
 }
 
+enum WiFiControlIssue {
+    case occupied, unavailable
+}
+
+func personalHotspotStatus(networks: [WiFiNetwork], permissionAuthorized: Bool,
+                           ownedSSID: String?, ownedBSSID: String?, sleeping: Bool,
+                           controlIssue: WiFiControlIssue?, phase: HotspotPhase) -> String {
+    if sleeping { return "已暂停" }
+    guard permissionAuthorized else { return "需要定位权限" }
+    if verifiedHotspotSSID(ownedSSID, bssid: ownedBSSID, networks: networks) != nil { return "已连接" }
+    if controlIssue == .occupied { return "其他应用占用" }
+    if controlIssue == .unavailable { return "控制权获取失败" }
+    switch phase {
+    case .activating, .joining, .confirming: return "连接中"
+    case .browsing: return "查找中"
+    case .retrying: return "暂不可用，重试中"
+    case .failed: return "暂不可用"
+    case .waitingForNetwork: return "准备中"
+    case .suspended: return "已暂停"
+    case .disabled, .networkAvailable: break
+    }
+    if networks.contains(where: { ($0.ssid != nil && $0.ssid != campusSSID) || ($0.ssid == nil && $0.bssid != nil) }) {
+        return "无法识别"
+    }
+    return "未连接"
+}
+
 enum CampusSearchResult: Equatable {
     case connected
     case absent
@@ -1195,6 +1222,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let wifiRecovery = WiFiRecovery()
     private let wifiControlLock = WiFiControlLock()
     private var ownsWiFiControl = false
+    private var wifiControlIssue: WiFiControlIssue?
     private let hotspot = HotspotController(discovery: RemoteHotspotDiscovery(), joiner: WiFiJoiner())
     private var ownedHotspotSSID: String?
     private var ownedHotspotBSSID: String?
@@ -1361,14 +1389,17 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         if ownsWiFiControl { return true }
         do {
             guard try wifiControlLock.tryAcquire() else {
+                wifiControlIssue = .occupied
                 wifiRecoveryDetail = "其他应用正在控制 Wi-Fi；请暂停 Sequoia Hotspot 后重试。"
                 diagnosticText = wifiRecoveryDetail
                 return false
             }
             ownsWiFiControl = true
+            wifiControlIssue = nil
             wifiRecoveryDetail = ""
             return true
         } catch {
+            wifiControlIssue = .unavailable
             wifiRecoveryDetail = "无法获取 Wi-Fi 控制权；请检查应用权限后重试。"
             diagnosticText = wifiRecoveryDetail
             return false
@@ -1529,6 +1560,20 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             return "正在检查…"
         }
         return state.detail.isEmpty ? "尚无检查记录" : state.detail
+    }
+
+    var personalHotspotStatusText: String {
+        personalHotspotStatus(networks: networks, permissionAuthorized: isLocationAuthorized,
+                              ownedSSID: ownedHotspotSSID, ownedBSSID: ownedHotspotBSSID,
+                              sleeping: networkSleeping,
+                              controlIssue: wifiControlIssue,
+                              phase: hotspot.phase)
+    }
+
+    var personalHotspotDetail: String {
+        if personalHotspotStatusText == "无法识别" { return "当前 Wi-Fi 并非由本应用确认的个人热点，无法判断其类型。" }
+        if hotspot.enabled { return hotspot.status }
+        return statusText
     }
 
     private func apply(state: AppState, shouldNotify: Bool) {
@@ -1697,6 +1742,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private var timer: Timer?
     private var animationTimer: Timer?
     private var campusItem: NSMenuItem?
+    private var hotspotItem: NSMenuItem?
     private var internetItem: NSMenuItem?
     private var online: Bool
 
@@ -1804,6 +1850,8 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     private func refreshMenu() {
         campusItem?.title = "校园网：\(campusConnectionStatus(networks: model.networks, permissionAuthorized: model.permissionStatus == .authorized, state: model.state))"
         campusItem?.toolTip = model.statusText
+        hotspotItem?.title = "个人热点：\(model.personalHotspotStatusText)"
+        hotspotItem?.toolTip = model.personalHotspotDetail
         internetItem?.title = "互联网：\(model.internetStatus.title)"
         internetItem?.toolTip = model.internetStatus.detail
     }
@@ -1822,6 +1870,8 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         menu.removeAllItems()
         info("")
         campusItem = menu.items.last
+        info("")
+        hotspotItem = menu.items.last
         info("")
         internetItem = menu.items.last
         menu.addItem(.separator())
@@ -1996,13 +2046,14 @@ enum SelfTest {
         statusBar.verifyStableIdentity()
         let menu = NSMenu()
         statusBar.menuNeedsUpdate(menu)
-        precondition(menu.items.count == 7)
+        precondition(menu.items.count == 8)
         precondition(menu.items[0].title.hasPrefix("校园网："))
-        precondition(menu.items[1].title.hasPrefix("互联网："))
-        precondition(menu.items[2].isSeparatorItem && menu.items[4].isSeparatorItem)
-        precondition(menu.items[3].title == "立即登录校园网" && menu.items[3].isEnabled)
-        precondition(menu.items[5].title == "设置" && menu.items[5].isEnabled)
-        precondition(menu.items[6].title == "退出" && menu.items[6].isEnabled)
+        precondition(menu.items[1].title.hasPrefix("个人热点："))
+        precondition(menu.items[2].title.hasPrefix("互联网："))
+        precondition(menu.items[3].isSeparatorItem && menu.items[5].isSeparatorItem)
+        precondition(menu.items[4].title == "立即登录校园网" && menu.items[4].isEnabled)
+        precondition(menu.items[6].title == "设置" && menu.items[6].isEnabled)
+        precondition(menu.items[7].title == "退出" && menu.items[7].isEnabled)
         (NSApp.delegate as? AppDelegate)?.refreshActivationPolicy()
         precondition(NSApp.activationPolicy() == .accessory)
         statusBar.stop()
@@ -2074,6 +2125,25 @@ enum SelfTest {
     private static func wifiRecoveryPolicy() {
         let disconnected = WiFiNetwork(interfaceName: "en0", ssid: nil, bssid: nil, ip: nil)
         let hotspot = WiFiNetwork(interfaceName: "en0", ssid: "Phone", bssid: "bb", ip: "192.0.2.2")
+        func hotspotStatus(_ networks: [WiFiNetwork], authorized: Bool = true, ssid: String? = nil,
+                           bssid: String? = nil, sleeping: Bool = false, issue: WiFiControlIssue? = nil,
+                           phase: HotspotPhase = .disabled) -> String {
+            personalHotspotStatus(networks: networks, permissionAuthorized: authorized,
+                                  ownedSSID: ssid, ownedBSSID: bssid, sleeping: sleeping,
+                                  controlIssue: issue, phase: phase)
+        }
+        precondition(hotspotStatus([hotspot], ssid: "Phone", bssid: "bb") == "已连接")
+        precondition(hotspotStatus([hotspot], ssid: "Phone", bssid: "other") == "无法识别")
+        precondition(hotspotStatus([hotspot]) == "无法识别")
+        precondition(hotspotStatus([hotspot], authorized: false) == "需要定位权限")
+        precondition(hotspotStatus([disconnected]) == "未连接")
+        precondition(hotspotStatus([hotspot], ssid: "Phone", bssid: "bb", sleeping: true) == "已暂停")
+        precondition(hotspotStatus([disconnected], issue: .occupied) == "其他应用占用")
+        precondition(hotspotStatus([disconnected], issue: .unavailable) == "控制权获取失败")
+        precondition(hotspotStatus([disconnected], phase: .joining) == "连接中")
+        precondition(hotspotStatus([disconnected], phase: .browsing) == "查找中")
+        precondition(hotspotStatus([disconnected], phase: .retrying(.joining)) == "暂不可用，重试中")
+        precondition(hotspotStatus([disconnected], phase: .failed(.discovery)) == "暂不可用")
         precondition(maySelectCampus(networks: [disconnected], permissionAuthorized: true, ownedHotspotSSID: nil))
         precondition(maySelectCampus(networks: [hotspot], permissionAuthorized: true, ownedHotspotSSID: "Phone"))
         // A remembered hotspot remains eligible after wake only when the live BSSID matches.
