@@ -10,26 +10,9 @@ BUNDLE_ID="com.nowaywastaken.csustautologin"
 echo "🔨 正在编译 Csust-Network-Automation App..."
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
-swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typecheck \
-	-target arm64-apple-macosx15.0 \
-	-framework AppKit \
-  -framework CoreLocation \
-  -framework CoreWLAN \
-  -framework CryptoKit \
-  -framework Network \
-  -framework ServiceManagement \
-  -framework UserNotifications \
-  NetworkAutoApp.swift ClashConnectivity.swift
-swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
-	-target arm64-apple-macosx15.0 \
-	-framework AppKit \
-  -framework CoreLocation \
-  -framework CoreWLAN \
-  -framework CryptoKit \
-  -framework Network \
-  -framework ServiceManagement \
-  -framework UserNotifications \
-  -o "$EXECUTABLE" NetworkAutoApp.swift ClashConnectivity.swift
+swift build -c release --product NetworkAuto --arch arm64
+SWIFT_BIN_PATH="$(swift build -c release --show-bin-path --arch arm64)"
+cp "$SWIFT_BIN_PATH/NetworkAuto" "$EXECUTABLE"
 cp Info.plist "$APP_PATH/Contents/Info.plist"
 [[ "$(plutil -extract CFBundleIdentifier raw -o - "$APP_PATH/Contents/Info.plist")" == "$BUNDLE_ID" ]]
 cp Assets/NetworkAuto.icns "$APP_PATH/Contents/Resources/NetworkAuto.icns"

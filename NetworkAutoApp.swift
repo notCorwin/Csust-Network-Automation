@@ -1,3 +1,4 @@
+import HotspotCore
 import AppKit
 import Combine
 import CoreLocation
@@ -424,6 +425,11 @@ func campusConnectionStatus(networks: [WiFiNetwork], permissionAuthorized: Bool,
     }
 }
 
+func shouldFallbackForAuthentication(_ state: AppState, campus: WiFiNetwork?) -> Bool {
+    guard !state.checking, let campus, state.network == campus.key else { return false }
+    return state.phase == "credentials" || state.phase == "config_error" || (state.phase == "retry" && state.attempt >= 3)
+}
+
 private func interfaceIPv4Addresses() -> [String: String] {
     var result: [String: String] = [:]
     var addressPointer: UnsafeMutablePointer<ifaddrs>?
@@ -489,11 +495,26 @@ final class WiFiMonitor: NSObject, CWEventDelegate {
     func clientConnectionInvalidated() { onChange?() }
 }
 
-// Association is separate from portal authentication: never replace an existing Wi-Fi link.
-func shouldRecoverWiFi(networks: [WiFiNetwork], permissionAuthorized: Bool, internetConnected: Bool) -> Bool {
-    permissionAuthorized && !internetConnected && !networks.contains {
-        $0.ssid != nil || $0.bssid != nil || $0.ip != nil
+// Only a link established by this coordinator may be replaced by campus Wi-Fi.
+func maySelectCampus(networks: [WiFiNetwork], permissionAuthorized: Bool, ownedHotspotSSID: String?) -> Bool {
+    guard permissionAuthorized else { return false }
+    return networks.allSatisfy { network in
+        if let ssid = network.ssid { return ssid == ownedHotspotSSID }
+        return network.bssid == nil && network.ip == nil
     }
+}
+
+func verifiedHotspotSSID(_ ssid: String?, bssid: String?, networks: [WiFiNetwork]) -> String? {
+    guard let ssid, let bssid, networks.contains(where: { $0.ssid == ssid && $0.bssid == bssid }) else { return nil }
+    return ssid
+}
+
+enum CampusSearchResult: Equatable {
+    case connected
+    case absent
+    case associationFailed
+    case failed(String)
+    case cancelled
 }
 
 @MainActor
@@ -502,73 +523,83 @@ final class WiFiRecovery {
     private var inFlight = false
     private var nextAttempt = ContinuousClock.now
     private var cancellation = CancellationSignal()
-    var onUpdate: ((String) -> Void)?
+    private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+    var onResult: ((CampusSearchResult) -> Void)?
+    var canRequest: Bool { !inFlight && ContinuousClock.now >= nextAttempt }
 
-    func cancel() {
-        cancellation.cancel()
+    func cancel() { cancellation.cancel() }
+
+    func waitUntilIdle() async {
+        if !inFlight { return }
+        await withCheckedContinuation { idleWaiters.append($0) }
     }
 
-    func request(snapshot: EngineSnapshot) {
+    func request(snapshot: EngineSnapshot, ownedHotspotSSID: String?) {
         let current = snapshot.read()
         guard !inFlight, ContinuousClock.now >= nextAttempt,
-              shouldRecoverWiFi(networks: current.networks, permissionAuthorized: current.permissionAuthorized,
-                                internetConnected: current.internetConnected) else { return }
+              maySelectCampus(networks: current.networks, permissionAuthorized: current.permissionAuthorized,
+                              ownedHotspotSSID: ownedHotspotSSID) else { return }
         inFlight = true
         cancellation = CancellationSignal()
         let cancellation = cancellation
-        onUpdate?("正在查找并连接校园 Wi-Fi…")
+        let generation = current.generation
         queue.async { [weak self] in
             let stillNeeded: @Sendable () -> Bool = {
                 let current = snapshot.read()
-                return !cancellation.isCancelled() && shouldRecoverWiFi(
+                return !cancellation.isCancelled() && current.generation == generation && maySelectCampus(
                     networks: current.networks, permissionAuthorized: current.permissionAuthorized,
-                    internetConnected: current.internetConnected
-                )
+                    ownedHotspotSSID: ownedHotspotSSID)
             }
-            let detail = Self.connect(stillNeeded: stillNeeded)
+            let result = Self.connect(ownedHotspotSSID: ownedHotspotSSID, stillNeeded: stillNeeded)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.inFlight = false
-                // Scan failures and missing APs must not create an event-driven busy loop.
+                let waiters = self.idleWaiters
+                self.idleWaiters.removeAll()
+                waiters.forEach { $0.resume() }
                 self.nextAttempt = cancellation.isCancelled() ? .now : .now.advanced(by: .seconds(15))
-                guard !cancellation.isCancelled(), let detail else { return }
-                self.onUpdate?(detail)
+                guard !cancellation.isCancelled() else { return }
+                self.onResult?(result)
             }
         }
     }
 
-    nonisolated private static func connect(stillNeeded: @Sendable () -> Bool) -> String? {
-        guard stillNeeded() else { return nil }
+    nonisolated private static func connect(ownedHotspotSSID: String?, stillNeeded: @Sendable () -> Bool) -> CampusSearchResult {
+        guard stillNeeded() else { return .cancelled }
         let client = CWWiFiClient()
         let interfaces = client.interfaces() ?? []
-        guard !interfaces.isEmpty else { return "未找到 Wi-Fi 接口，请检查系统网络设置。" }
-        func hasConnection() -> Bool {
-            interfaces.contains { $0.ssid() != nil || $0.bssid() != nil }
+        guard !interfaces.isEmpty else { return .failed("未找到 Wi-Fi 接口，请检查系统网络设置。") }
+        func mayReplaceLinks() -> Bool {
+            interfaces.allSatisfy { interface in
+                if let ssid = interface.ssid() { return ssid == ownedHotspotSSID }
+                return interface.bssid() == nil
+            }
         }
-        var failures: [String] = []
+        var scanned = false
+        var scanFailure = false
+        var associationFailure = false
         for interface in interfaces {
-            guard stillNeeded(), !hasConnection() else { return nil }
+            guard stillNeeded(), mayReplaceLinks() else { return .cancelled }
             do {
                 if !interface.powerOn() { try interface.setPower(true) }
-                guard stillNeeded(), !hasConnection() else { return nil }
+                guard stillNeeded(), mayReplaceLinks() else { return .cancelled }
                 let candidates = try interface.scanForNetworks(withSSID: Data(campusSSID.utf8))
                     .filter { $0.ssid == campusSSID && $0.supportsSecurity(.none) && !$0.ibss }
                     .sorted { $0.rssiValue > $1.rssiValue }
+                scanned = true
                 for network in candidates {
-                    guard stillNeeded(), !hasConnection() else { return nil }
+                    guard stillNeeded(), mayReplaceLinks() else { return .cancelled }
                     do {
                         try interface.associate(to: network, password: nil)
-                        return "已连接校园 Wi-Fi，正在检查校园网登录。"
-                    } catch {
-                        failures.append("连接失败：\(error.localizedDescription)")
-                    }
+                        return .connected
+                    } catch { associationFailure = true }
                 }
-            } catch {
-                failures.append("Wi-Fi 操作失败：\(error.localizedDescription)")
-            }
+            } catch { scanFailure = true }
         }
-        if failures.isEmpty { return "未发现可连接的 CSUST-Student，将在下次检查时重试。" }
-        return "\(failures.last!)；将自动重试。若持续失败，请检查系统 Wi-Fi 设置与定位权限。"
+        guard stillNeeded() else { return .cancelled }
+        if associationFailure { return .associationFailed }
+        if scanFailure || !scanned { return .failed("扫描校园 Wi-Fi 失败；请检查系统 Wi-Fi 设置与定位权限。") }
+        return .absent
     }
 }
 
@@ -946,13 +977,14 @@ final class AutoLoginEngine: @unchecked Sendable {
     private var pending = false
     private var scheduled = false
     private var authenticatedGeneration: UInt64?
-    var onUpdate: (@Sendable (AppState, Bool) -> Void)?
+    private var stateGeneration: UInt64?
+    var onUpdate: (@Sendable (AppState, Bool, UInt64) -> Void)?
 
     init(
         store: AppStore,
         snapshot: EngineSnapshot,
         authenticate: @escaping @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String) = { LoginService.login(config: $0, ip: $1, stillConnected: $2) },
-        onUpdate: (@Sendable (AppState, Bool) -> Void)? = nil
+        onUpdate: (@Sendable (AppState, Bool, UInt64) -> Void)? = nil
     ) {
         self.store = store
         self.logger = LogStore(paths: store.paths)
@@ -1011,6 +1043,9 @@ final class AutoLoginEngine: @unchecked Sendable {
     }
 
     private func runCycle(manual: Bool) {
+        let generation = snapshot.read().generation
+        if stateGeneration != generation { state.attempt = 0 }
+        stateGeneration = generation
         state.checking = true
         state.checkedAt = Int64(Date().timeIntervalSince1970)
         publish(state: state, shouldNotify: false)
@@ -1028,6 +1063,10 @@ final class AutoLoginEngine: @unchecked Sendable {
         var useInternetEvidence = !manual
         while !cancellation.isCancelled() {
             let current = snapshot.read()
+            if stateGeneration != current.generation {
+                stateGeneration = current.generation
+                state.attempt = 0
+            }
             guard current.permissionAuthorized else {
                 state.network = ""
                 state.route = ""
@@ -1046,6 +1085,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             let key = network.key
             if state.network != key {
                 state.network = key
+                state.attempt = 0
                 state.failureSince = nil
                 state.notified = false
                 useInternetEvidence = !manual
@@ -1099,6 +1139,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             switch outcome.0 {
             case .online:
                 authenticatedGeneration = generation
+                state.attempt = 0
                 state.route = outcome.1
                 record(phase: "online", detail: confirmingSession ? "校园网会话有效。" : "登录成功或已经在线。")
                 return
@@ -1110,6 +1151,8 @@ final class AutoLoginEngine: @unchecked Sendable {
             case .retry(let detail):
                 state.route = outcome.1
                 record(phase: "retry", detail: detail)
+                // Bound one authentication round so the coordinator can fall back.
+                if state.attempt >= 3 { return }
                 continue
             case .networkChanged:
                 state.route = outcome.1
@@ -1131,7 +1174,7 @@ final class AutoLoginEngine: @unchecked Sendable {
     }
 
     private func publish(state: AppState, shouldNotify: Bool) {
-        onUpdate?(state, shouldNotify)
+        onUpdate?(state, shouldNotify, stateGeneration ?? snapshot.read().generation)
     }
 }
 
@@ -1150,6 +1193,15 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let locationManager = CLLocationManager()
     private let wifiMonitor = WiFiMonitor()
     private let wifiRecovery = WiFiRecovery()
+    private let wifiControlLock = WiFiControlLock()
+    private var ownsWiFiControl = false
+    private let hotspot = HotspotController(discovery: RemoteHotspotDiscovery(), joiner: WiFiJoiner())
+    private var ownedHotspotSSID: String?
+    private var ownedHotspotBSSID: String?
+    private var pendingHotspotSSID: String?
+    private var campusAssociationFailures = 0
+    private var fallbackUntil: ContinuousClock.Instant?
+    private var campusSearchTask: Task<Void, Never>?
     private var networkSleeping = false
     private var networkPathReady = false
     private var wifiRecoveryDetail = ""
@@ -1165,9 +1217,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         AutoLoginEngine(
             store: store,
             snapshot: engineSnapshot,
-            onUpdate: { [weak self] state, shouldNotify in
+            onUpdate: { [weak self] state, shouldNotify, generation in
                 Task { @MainActor [weak self] in
-                    self?.apply(state: state, shouldNotify: shouldNotify)
+                    guard let self, self.engineSnapshot.read().generation == generation else { return }
+                    self.apply(state: state, shouldNotify: shouldNotify)
                 }
             }
         )
@@ -1197,12 +1250,41 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         requestNotificationPermission()
         registerLaunchAtLogin()
 
-        wifiRecovery.onUpdate = { [weak self] detail in
+        hotspot.changed = { [weak self] in
             guard let self else { return }
-            self.wifiRecoveryDetail = detail
-            self.diagnosticText = detail
+            self.pendingHotspotSSID = self.hotspot.requestedSSID
+            if self.hotspot.enabled {
+                self.wifiRecoveryDetail = self.hotspot.status
+                self.diagnosticText = self.hotspot.status
+            }
+        }
+        wifiRecovery.onResult = { [weak self] result in
+            guard let self else { return }
             self.refreshNetworks()
-            self.engine.request()
+            switch result {
+            case .connected:
+                self.campusAssociationFailures = 0
+                self.ownedHotspotSSID = nil
+                self.ownedHotspotBSSID = nil
+                self.wifiRecoveryDetail = "已连接校园 Wi-Fi，正在检查校园网登录。"
+                self.engine.request()
+            case .absent:
+                self.campusAssociationFailures = 0
+                self.wifiRecoveryDetail = "未发现校园网，正在查找热点。"
+                self.startHotspotIfAllowed()
+            case .associationFailed:
+                self.campusAssociationFailures += 1
+                self.wifiRecoveryDetail = "连接校园 Wi-Fi 失败；请检查系统 Wi-Fi 设置。"
+                if self.campusAssociationFailures >= 3 {
+                    self.campusAssociationFailures = 0
+                    self.fallbackUntil = ContinuousClock.now.advanced(by: .seconds(120))
+                    self.startHotspotIfAllowed()
+                }
+            case .failed(let message):
+                self.wifiRecoveryDetail = message
+                self.diagnosticText = message
+            case .cancelled: break
+            }
         }
         wifiMonitor.onChange = { [weak self] in
             Task { @MainActor [weak self] in self?.requestCheck() }
@@ -1248,7 +1330,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
     }
 
-    func stop() {
+    func stop() async {
+        guard started else { return }
         started = false
         connectivityTimer?.invalidate()
         connectivityTimer = nil
@@ -1256,8 +1339,16 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         pathMonitor.cancel()
         wifiRecovery.cancel()
+        campusSearchTask?.cancel()
+        hotspot.setEnabled(false)
         wifiMonitor.stop()
         engine.stop()
+        if ownsWiFiControl {
+            await hotspot.waitUntilIdle()
+            await wifiRecovery.waitUntilIdle()
+            wifiControlLock.release()
+            ownsWiFiControl = false
+        }
     }
 
     func requestCheck() {
@@ -1266,19 +1357,112 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         engine.request()
     }
 
+    private func acquireWiFiControlIfNeeded() -> Bool {
+        if ownsWiFiControl { return true }
+        do {
+            guard try wifiControlLock.tryAcquire() else {
+                wifiRecoveryDetail = "其他应用正在控制 Wi-Fi；请暂停 Sequoia Hotspot 后重试。"
+                diagnosticText = wifiRecoveryDetail
+                return false
+            }
+            ownsWiFiControl = true
+            wifiRecoveryDetail = ""
+            return true
+        } catch {
+            wifiRecoveryDetail = "无法获取 Wi-Fi 控制权；请检查应用权限后重试。"
+            diagnosticText = wifiRecoveryDetail
+            return false
+        }
+    }
+
+    private func startHotspotIfAllowed() {
+        guard started, networkPathReady, !networkSleeping, isLocationAuthorized,
+              acquireWiFiControlIfNeeded() else { return }
+        let path = pathMonitor.currentPath
+        guard !(path.status == .satisfied && path.usesInterfaceType(.wiredEthernet)) else { return }
+        let campusFallback = fallbackUntil.map { ContinuousClock.now < $0 } ?? false
+        if let owned = verifiedHotspotSSID(ownedHotspotSSID, bssid: ownedHotspotBSSID, networks: networks),
+           networks.contains(where: { $0.ssid == owned && $0.ip != nil }) {
+            if hotspot.enabled { hotspot.setEnabled(false) }
+            wifiRecoveryDetail = "已连接热点，等待校园网恢复。"
+            return
+        }
+        let allowed = maySelectCampus(networks: networks, permissionAuthorized: true, ownedHotspotSSID: verifiedHotspotSSID(ownedHotspotSSID, bssid: ownedHotspotBSSID, networks: networks))
+            || (campusFallback && selectNetwork(networks) != nil && networks.allSatisfy {
+                if let ssid = $0.ssid { return ssid == campusSSID }
+                return $0.bssid == nil && $0.ip == nil
+            })
+        guard allowed else { return }
+        if !hotspot.enabled { hotspot.setEnabled(true) }
+        hotspot.networkAvailable(false)
+    }
+
     private func recoverWiFiIfNeeded() {
         guard started, networkPathReady, !networkSleeping else { return }
+        guard acquireWiFiControlIfNeeded() else { return }
         let path = pathMonitor.currentPath
         if path.status == .satisfied && path.usesInterfaceType(.wiredEthernet) {
             wifiRecovery.cancel()
+            hotspot.setEnabled(false)
             return
         }
-        wifiRecovery.request(snapshot: engineSnapshot)
+        guard isLocationAuthorized else {
+            wifiRecovery.cancel()
+            hotspot.setEnabled(false)
+            return
+        }
+        if let until = fallbackUntil, ContinuousClock.now < until {
+            startHotspotIfAllowed()
+            return
+        }
+        fallbackUntil = nil
+        if selectNetwork(networks) != nil {
+            wifiRecovery.cancel()
+            hotspot.setEnabled(false)
+            return
+        }
+        // While joining, a link to the requested SSID is not yet proof of ownership.
+        // Wait for its address and path confirmation instead of cancelling the join.
+        if hotspot.busy {
+            let linked = networks.filter { $0.ssid != nil || $0.bssid != nil || $0.ip != nil }
+            if linked.isEmpty || (pendingHotspotSSID != nil && linked.allSatisfy({ $0.ssid == pendingHotspotSSID })) { return }
+            hotspot.setEnabled(false)
+        }
+        let verifiedSSID = verifiedHotspotSSID(ownedHotspotSSID, bssid: ownedHotspotBSSID, networks: networks)
+        guard maySelectCampus(networks: networks, permissionAuthorized: true, ownedHotspotSSID: verifiedSSID) else {
+            wifiRecovery.cancel()
+            hotspot.setEnabled(false)
+            if networks.contains(where: { $0.ssid != nil }) {
+                ownedHotspotSSID = nil
+                ownedHotspotBSSID = nil
+            }
+            return
+        }
+        guard campusSearchTask == nil, wifiRecovery.canRequest else { return }
+        if hotspot.enabled { hotspot.setEnabled(false) }
+        let generation = engineSnapshot.read().generation
+        campusSearchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.hotspot.waitUntilIdle()
+            self.campusSearchTask = nil
+            guard !Task.isCancelled, self.started, !self.networkSleeping,
+                  self.engineSnapshot.read().generation == generation,
+                  self.fallbackUntil == nil,
+                  !(self.pathMonitor.currentPath.status == .satisfied && self.pathMonitor.currentPath.usesInterfaceType(.wiredEthernet)),
+                  maySelectCampus(networks: self.networks, permissionAuthorized: self.isLocationAuthorized,
+                                  ownedHotspotSSID: verifiedHotspotSSID(self.ownedHotspotSSID, bssid: self.ownedHotspotBSSID, networks: self.networks)) else { return }
+            self.wifiRecovery.request(snapshot: self.engineSnapshot, ownedHotspotSSID: verifiedHotspotSSID(self.ownedHotspotSSID, bssid: self.ownedHotspotBSSID, networks: self.networks))
+        }
     }
 
     @objc private func networkWillSleep(_ notification: Notification) {
         networkSleeping = true
         wifiRecovery.cancel()
+        campusSearchTask?.cancel()
+        hotspot.suspend()
+        hotspot.setEnabled(false)
+        fallbackUntil = nil
+        pendingHotspotSSID = nil
         engineSnapshot.invalidateNetwork()
         internetMonitor.reset(networkAvailable: false)
     }
@@ -1304,7 +1488,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
                 try store.saveConfig(newConfig)
                 config = newConfig
                 diagnosticText = "配置已保存。"
-                engine.request()
+                fallbackUntil = nil
+                hotspot.setEnabled(false)
+                engineSnapshot.invalidateNetwork()
+                requestCheck()
             } catch {
                 diagnosticText = "保存失败：\(error.localizedDescription)"
             }
@@ -1335,6 +1522,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             default: return "需要定位权限"
             }
         }
+        if started && !ownsWiFiControl && !wifiRecoveryDetail.isEmpty { return wifiRecoveryDetail }
+        if hotspot.enabled, !wifiRecoveryDetail.isEmpty { return wifiRecoveryDetail }
         if state.phase == "outside", !wifiRecoveryDetail.isEmpty { return wifiRecoveryDetail }
         if state.checking {
             return "正在检查…"
@@ -1344,6 +1533,11 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     private func apply(state: AppState, shouldNotify: Bool) {
         self.state = state
+        if shouldFallbackForAuthentication(state, campus: selectNetwork(networks)), fallbackUntil == nil {
+            fallbackUntil = ContinuousClock.now.advanced(by: .seconds(120))
+            wifiRecovery.cancel()
+            startHotspotIfAllowed()
+        }
         if manualCheckRequested && !state.checking {
             manualCheckRequested = false
             diagnosticText = state.detail
@@ -1363,11 +1557,20 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     private func refreshNetworks() {
         let refreshed = wifiMonitor.networks()
-        if networks != refreshed { internetMonitor.reset() }
+        if let pending = pendingHotspotSSID, hotspot.busy,
+           let connected = refreshed.first(where: { $0.ssid == pending && $0.ip != nil && $0.bssid != nil }),
+           pathMonitor.currentPath.status == .satisfied,
+           pathMonitor.currentPath.usesInterfaceType(.wifi) {
+            ownedHotspotSSID = pending
+            ownedHotspotBSSID = connected.bssid
+            hotspot.networkAvailable(true)
+        }
+        let networkChanged = networks != refreshed
+        if networkChanged { internetMonitor.reset() }
         networks = refreshed
-        if refreshed.contains(where: { $0.ssid != nil || $0.bssid != nil || $0.ip != nil }) {
-            wifiRecoveryDetail = ""
+        if !maySelectCampus(networks: refreshed, permissionAuthorized: isLocationAuthorized, ownedHotspotSSID: verifiedHotspotSSID(ownedHotspotSSID, bssid: ownedHotspotBSSID, networks: refreshed)) {
             wifiRecovery.cancel()
+            if networkChanged { campusAssociationFailures = 0 }
         }
         engineSnapshot.update(
             networks: networks,
@@ -1696,9 +1899,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signalReadinessIfRequested()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await AppModel.shared.stop()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: nil)
-        AppModel.shared.stop()
         statusBar?.stop()
         statusBar = nil
     }
@@ -1832,6 +2042,18 @@ enum SelfTest {
         precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "登录中")
         campusState.checking = false
         precondition(campusConnectionStatus(networks: [campus], permissionAuthorized: true, state: campusState) == "认证失败")
+        precondition(shouldFallbackForAuthentication(campusState, campus: campus))
+        // A new authentication round must complete before an earlier failure can trigger fallback.
+        campusState.checking = true
+        precondition(!shouldFallbackForAuthentication(campusState, campus: campus))
+        campusState.phase = "online"
+        campusState.checking = false
+        precondition(!shouldFallbackForAuthentication(campusState, campus: campus))
+        campusState.phase = "retry"
+        campusState.attempt = 1
+        precondition(!shouldFallbackForAuthentication(campusState, campus: campus))
+        campusState.attempt = 3
+        precondition(shouldFallbackForAuthentication(campusState, campus: campus))
         precondition(config.validationError() == nil)
         let encodedConfig = try! JSONEncoder().encode(config)
         precondition(String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
@@ -1841,6 +2063,7 @@ enum SelfTest {
         precondition(configFingerprint(config) != configFingerprint(changedConfig))
         storeMigrationAndPersistence()
         engineCancellationAndMutex()
+        authenticationAttemptsResetAfterSuccess()
         manualLoginBypassesConnectivity()
         ClashConnectivitySelfTest.run()
         httpLogin(proxy: false)
@@ -1850,9 +2073,17 @@ enum SelfTest {
 
     private static func wifiRecoveryPolicy() {
         let disconnected = WiFiNetwork(interfaceName: "en0", ssid: nil, bssid: nil, ip: nil)
-        precondition(shouldRecoverWiFi(networks: [disconnected], permissionAuthorized: true, internetConnected: false))
-        precondition(!shouldRecoverWiFi(networks: [disconnected], permissionAuthorized: false, internetConnected: false))
-        precondition(!shouldRecoverWiFi(networks: [disconnected], permissionAuthorized: true, internetConnected: true))
+        let hotspot = WiFiNetwork(interfaceName: "en0", ssid: "Phone", bssid: "bb", ip: "192.0.2.2")
+        precondition(maySelectCampus(networks: [disconnected], permissionAuthorized: true, ownedHotspotSSID: nil))
+        precondition(maySelectCampus(networks: [hotspot], permissionAuthorized: true, ownedHotspotSSID: "Phone"))
+        // A remembered hotspot remains eligible after wake only when the live BSSID matches.
+        precondition(verifiedHotspotSSID("Phone", bssid: "bb", networks: [hotspot]) == "Phone")
+        precondition(verifiedHotspotSSID("Phone", bssid: "bb", networks: [disconnected]) == nil)
+        precondition(verifiedHotspotSSID("Phone", bssid: "different", networks: [hotspot]) == nil)
+        precondition(!maySelectCampus(networks: [hotspot], permissionAuthorized: false, ownedHotspotSSID: "Phone"))
+        precondition(!maySelectCampus(networks: [hotspot], permissionAuthorized: true, ownedHotspotSSID: nil))
+        precondition(!maySelectCampus(networks: [hotspot, WiFiNetwork(interfaceName: "en1", ssid: "Other", bssid: "cc", ip: nil)], permissionAuthorized: true, ownedHotspotSSID: "Phone"))
+        precondition(!maySelectCampus(networks: [WiFiNetwork(interfaceName: "en0", ssid: nil, bssid: "bb", ip: nil)], permissionAuthorized: true, ownedHotspotSSID: "Phone"))
         // A hidden SSID, a pending DHCP lease, or a second associated adapter must prevent takeover.
         for connected in [
             WiFiNetwork(interfaceName: "en1", ssid: "other", bssid: nil, ip: nil),
@@ -1860,7 +2091,7 @@ enum SelfTest {
             WiFiNetwork(interfaceName: "en1", ssid: nil, bssid: nil, ip: "192.0.2.1"),
             WiFiNetwork(interfaceName: "en1", ssid: campusSSID, bssid: "aa", ip: nil)
         ] {
-            precondition(!shouldRecoverWiFi(networks: [disconnected, connected], permissionAuthorized: true, internetConnected: false))
+            precondition(!maySelectCampus(networks: [disconnected, connected], permissionAuthorized: true, ownedHotspotSSID: nil))
         }
     }
 
@@ -1951,7 +2182,7 @@ enum SelfTest {
         permissionSnapshot.update(networks: [], permissionAuthorized: false)
         let permissionWaiting = DispatchSemaphore(value: 0)
         do {
-            let permissionEngine = AutoLoginEngine(store: store, snapshot: permissionSnapshot, onUpdate: { state, _ in
+            let permissionEngine = AutoLoginEngine(store: store, snapshot: permissionSnapshot, onUpdate: { state, _, _ in
                 if state.phase == "permission" { permissionWaiting.signal() }
             })
             permissionEngine.start()
@@ -1965,7 +2196,7 @@ enum SelfTest {
         )
         let observed = LockedAppState()
         let waiting = DispatchSemaphore(value: 0)
-        let engine = AutoLoginEngine(store: store, snapshot: snapshot, onUpdate: { state, _ in
+        let engine = AutoLoginEngine(store: store, snapshot: snapshot, onUpdate: { state, _, _ in
             observed.set(state)
             if state.phase == "outside" && !state.checking { waiting.signal() }
         })
@@ -1976,6 +2207,47 @@ enum SelfTest {
         let started = Date()
         engine.stop()
         precondition(Date().timeIntervalSince(started) < 1)
+    }
+
+    private static func authenticationAttemptsResetAfterSuccess() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("csust-attempt-test-\(UUID().uuidString)")
+        let paths = AppPaths(data: root, legacyConfig: root.appendingPathComponent("config.json"),
+                             legacyState: root.appendingPathComponent("state.json"), logs: root.appendingPathComponent("logs"))
+        let suiteName = "csust-attempt-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = AppStore(defaults: defaults, paths: paths)
+        try! store.saveConfig(AppConfig(username: "account", password: "password"))
+        let snapshot = EngineSnapshot()
+        snapshot.update(networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: "10.183.0.2")], permissionAuthorized: true)
+        let calls = LockedString()
+        let firstSuccess = DispatchSemaphore(value: 0)
+        let laterFailure = DispatchSemaphore(value: 0)
+        let observed = LockedAppState()
+        let engine = AutoLoginEngine(store: store, snapshot: snapshot, authenticate: { _, _, _ in
+            let count = (Int(calls.get()) ?? 0) + 1
+            calls.set(String(count))
+            return (count == 3 || count >= 5 ? .online : .retry("temporary"), "direct")
+        }, onUpdate: { state, _, _ in
+            if !state.checking && state.phase == "online" && calls.get() == "3" {
+                observed.set(state)
+                firstSuccess.signal()
+            }
+            if state.phase == "retry" && calls.get() == "4" {
+                observed.set(state)
+                laterFailure.signal()
+            }
+        })
+        engine.start()
+        precondition(firstSuccess.wait(timeout: .now() + 3) == .success)
+        precondition(observed.get().attempt == 0)
+        engine.checkNow()
+        precondition(laterFailure.wait(timeout: .now() + 3) == .success)
+        precondition(observed.get().attempt == 1)
+        engine.stop()
     }
 
     private static func manualLoginBypassesConnectivity() {
@@ -2009,7 +2281,7 @@ enum SelfTest {
                 authentication.set("called")
                 return (.online, "direct")
             },
-            onUpdate: { state, _ in
+            onUpdate: { state, _, _ in
                 if !state.checking && (state.phase == "online" || state.phase == "outside") { completed.signal() }
             }
         )
@@ -2053,7 +2325,7 @@ enum SelfTest {
                 authentication.set("second")
                 return (.online, "direct")
             },
-            onUpdate: { state, _ in
+            onUpdate: { state, _, _ in
                 observed.set(state)
                 if !state.checking && state.phase == "online" { reconnected.signal() }
             }
