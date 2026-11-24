@@ -109,22 +109,38 @@ enum AppInstanceLockError: Error, LocalizedError {
 }
 
 final class AppInstanceLock: @unchecked Sendable {
-    private let descriptor: Int32
+    let descriptor: Int32
 
     init(path: URL) throws {
-        let descriptor = Darwin.open(path.path, O_CREAT | O_RDWR, mode_t(0o600))
-        guard descriptor >= 0 else {
-            throw AppInstanceLockError.openFailed(String(cString: strerror(errno)))
-        }
-        if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
-            let error = errno
-            close(descriptor)
-            if error == EWOULDBLOCK || error == EAGAIN {
-                throw AppInstanceLockError.alreadyRunning
+        // Retry if the lock file was unlinked or replaced between open() and flock().
+        for _ in 0..<3 {
+            let descriptor = Darwin.open(path.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+            guard descriptor >= 0 else {
+                throw AppInstanceLockError.openFailed(String(cString: strerror(errno)))
             }
-            throw AppInstanceLockError.lockFailed(String(cString: strerror(error)))
+            var info = stat()
+            guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid() else {
+                close(descriptor)
+                throw AppInstanceLockError.lockFailed("运行锁文件类型或权限无效")
+            }
+            if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+                let error = errno
+                close(descriptor)
+                if error == EWOULDBLOCK || error == EAGAIN {
+                    throw AppInstanceLockError.alreadyRunning
+                }
+                throw AppInstanceLockError.lockFailed(String(cString: strerror(error)))
+            }
+            var pathInfo = stat()
+            if lstat(path.path, &pathInfo) == 0,
+               pathInfo.st_dev == info.st_dev,
+               pathInfo.st_ino == info.st_ino {
+                self.descriptor = descriptor
+                return
+            }
+            close(descriptor)
         }
-        self.descriptor = descriptor
+        throw AppInstanceLockError.lockFailed("运行锁状态不稳定")
     }
 
     deinit {
@@ -456,20 +472,44 @@ private func interfaceIPv4Addresses() -> [String: String] {
     }
 }
 
-final class WiFiMonitor: NSObject, CWEventDelegate {
+final class WiFiMonitor: NSObject, CWEventDelegate, @unchecked Sendable {
     private let client = CWWiFiClient.shared()
+    private let lock = NSLock()
+    private var monitoring = false
     var onChange: (() -> Void)?
 
     func start() {
-        client.delegate = self
-        for event in [CWEventType.ssidDidChange, .bssidDidChange, .linkDidChange, .powerDidChange] {
-            _ = try? client.startMonitoringEvent(with: event)
-        }
+        lock.lock()
+        monitoring = true
+        lock.unlock()
+        registerEvents()
         onChange?()
     }
 
     func stop() {
+        lock.lock()
+        monitoring = false
+        lock.unlock()
         _ = try? client.stopMonitoringAllEvents()
+    }
+
+    private func registerEvents() {
+        client.delegate = self
+        for event in [CWEventType.ssidDidChange, .bssidDidChange, .linkDidChange, .powerDidChange] {
+            _ = try? client.startMonitoringEvent(with: event)
+        }
+    }
+
+    private func scheduleResubscribe() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let active = self.monitoring
+            self.lock.unlock()
+            guard active else { return }
+            self.registerEvents()
+            self.onChange?()
+        }
     }
 
     func networks() -> [WiFiNetwork] {
@@ -520,8 +560,55 @@ final class WiFiMonitor: NSObject, CWEventDelegate {
     func linkDidChangeForWiFiInterface(withName interfaceName: String) { onChange?() }
     func powerStateDidChangeForWiFiInterface(withName interfaceName: String) { onChange?() }
 
-    func clientConnectionInterrupted() { onChange?() }
-    func clientConnectionInvalidated() { onChange?() }
+    func clientConnectionInterrupted() { scheduleResubscribe(); onChange?() }
+    func clientConnectionInvalidated() { scheduleResubscribe(); onChange?() }
+}
+
+struct PathSignature: Equatable, Sendable {
+    let satisfied: Bool
+    let usesWiFi: Bool
+    let usesEthernet: Bool
+    let isExpensive: Bool
+    let interfaces: [String]
+    let gateways: [String]
+
+    init(satisfied: Bool, usesWiFi: Bool, usesEthernet: Bool, isExpensive: Bool,
+         interfaces: [String], gateways: [String]) {
+        self.satisfied = satisfied
+        self.usesWiFi = usesWiFi
+        self.usesEthernet = usesEthernet
+        self.isExpensive = isExpensive
+        self.interfaces = interfaces
+        self.gateways = gateways
+    }
+
+    init(_ path: NWPath) {
+        self.satisfied = path.status == .satisfied
+        self.usesWiFi = path.usesInterfaceType(.wifi)
+        self.usesEthernet = path.usesInterfaceType(.wiredEthernet)
+        self.isExpensive = path.isExpensive
+        self.interfaces = path.availableInterfaces.map(\.name).sorted()
+        self.gateways = path.gateways.map(\.debugDescription).sorted()
+    }
+}
+
+func shouldPauseCampusSearchForHotspot(enabled: Bool, phase: HotspotPhase) -> Bool {
+    guard enabled else { return false }
+    switch phase {
+    case .browsing, .activating, .joining, .confirming, .retrying:
+        return true
+    case .disabled, .suspended, .waitingForNetwork, .networkAvailable, .failed:
+        return false
+    }
+}
+
+func fallbackCooldownSeconds(consecutiveFallbacks: Int) -> Int {
+    let exponent = min(max(0, consecutiveFallbacks - 1), 3)
+    return min(120 * (1 << exponent), 600)
+}
+
+func campusCandidateEligible(rssi: Int, replacingHotspot: Bool) -> Bool {
+    replacingHotspot ? rssi >= -72 : true
 }
 
 // Only a link established by this coordinator may be replaced by campus Wi-Fi.
@@ -664,7 +751,9 @@ final class WiFiRecovery {
                 let waiters = self.idleWaiters
                 self.idleWaiters.removeAll()
                 waiters.forEach { $0.resume() }
-                self.nextAttempt = cancellation.isCancelled() ? .now : .now.advanced(by: .seconds(15))
+                self.nextAttempt = cancellation.isCancelled()
+                    ? .now
+                    : .now.advanced(by: .seconds(ownedHotspotSSID != nil ? 90 : 15))
                 guard !cancellation.isCancelled() else { return }
                 self.onResult?(result)
             }
@@ -688,10 +777,22 @@ final class WiFiRecovery {
         for interface in interfaces {
             guard stillNeeded(), mayReplaceLinks() else { return .cancelled }
             do {
-                if !interface.powerOn() { try interface.setPower(true) }
+                if !interface.powerOn() {
+                    try interface.setPower(true)
+                    for _ in 0..<15 {
+                        guard stillNeeded(), mayReplaceLinks() else { return .cancelled }
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                }
                 guard stillNeeded(), mayReplaceLinks() else { return .cancelled }
+                let replacingHotspot = ownedHotspotSSID != nil
                 let candidates = try interface.scanForNetworks(withSSID: Data(campusSSID.utf8))
-                    .filter { $0.ssid == campusSSID && $0.supportsSecurity(.none) && !$0.ibss }
+                    .filter {
+                        $0.ssid == campusSSID
+                            && $0.supportsSecurity(.none)
+                            && !$0.ibss
+                            && campusCandidateEligible(rssi: $0.rssiValue, replacingHotspot: replacingHotspot)
+                    }
                     .sorted { $0.rssiValue > $1.rssiValue }
                 scanned = true
                 for network in candidates {
@@ -817,7 +918,7 @@ enum LoginService {
                 systemProxy: systemProxy
             ) {
             case .failure(let error):
-                errors.append("\(routeLabel(route))：\(error)")
+                errors.append("\(routeLabel(route))：\(error.message)")
             case .success(let response):
                 if !stillConnected() { return (.networkChanged, lastRoute) }
                 let outcome: AuthOutcome
@@ -1077,6 +1178,8 @@ final class AutoLoginEngine: @unchecked Sendable {
     private let logger: LogStore
     private let snapshot: EngineSnapshot
     private let authenticate: @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String)
+    private let retryDelays: [TimeInterval]
+    private let ipWaitTimeout: TimeInterval
     private let cancellation = CancellationSignal()
     private let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.engine", qos: .utility)
     private var state: AppState
@@ -1085,17 +1188,24 @@ final class AutoLoginEngine: @unchecked Sendable {
     private var scheduled = false
     private var authenticatedGeneration: UInt64?
     private var stateGeneration: UInt64?
+    private var lastLoggedPhase = ""
+    private var lastLoggedDetail = ""
+    private var lastLoggedAt: Int64 = 0
     var onUpdate: (@Sendable (AppState, Bool, UInt64) -> Void)?
 
     init(
         store: AppStore,
         snapshot: EngineSnapshot,
+        retryDelays: [TimeInterval] = [1.0, 2.0],
+        ipWaitTimeout: TimeInterval = 5.0,
         authenticate: @escaping @Sendable (AppConfig, String, @escaping @Sendable () -> Bool) -> (AuthOutcome, String) = { LoginService.login(config: $0, ip: $1, stillConnected: $2) },
         onUpdate: (@Sendable (AppState, Bool, UInt64) -> Void)? = nil
     ) {
         self.store = store
         self.logger = LogStore(paths: store.paths)
         self.snapshot = snapshot
+        self.retryDelays = retryDelays
+        self.ipWaitTimeout = ipWaitTimeout
         self.authenticate = authenticate
         self.state = store.loadState()
         self.onUpdate = onUpdate
@@ -1189,7 +1299,17 @@ final class AutoLoginEngine: @unchecked Sendable {
                 record(phase: "outside", detail: "未连接校园网，等待网络变化。")
                 return
             }
-            let key = network.key
+            guard let usableIP = waitForCampusIPv4(initial: network) else {
+                let latest = snapshot.read()
+                guard !cancellation.isCancelled(), latest.permissionAuthorized,
+                      let stillCampus = selectNetwork(latest.networks) else { continue }
+                state.network = stillCampus.key
+                state.route = ""
+                record(phase: "waiting_ip", detail: "已连接校园 Wi‑Fi，等待分配 IPv4 地址…")
+                return
+            }
+            let activeNetwork = selectNetwork(snapshot.read().networks) ?? network
+            let key = activeNetwork.key
             if state.network != key {
                 state.network = key
                 state.attempt = 0
@@ -1198,14 +1318,15 @@ final class AutoLoginEngine: @unchecked Sendable {
                 useInternetEvidence = !manual
             }
 
-            let generation = current.generation
+            let generation = snapshot.read().generation
+            stateGeneration = generation
             let stillConnected: @Sendable () -> Bool = { [snapshot, cancellation] in
                 guard !cancellation.isCancelled() else { return false }
                 let current = snapshot.read()
                 return current.permissionAuthorized && current.generation == generation && selectNetwork(current.networks)?.key == key
             }
             if useInternetEvidence {
-                if authenticatedGeneration == generation && current.internetConnected && stillConnected() {
+                if authenticatedGeneration == generation && snapshot.read().internetConnected && stillConnected() {
                     state.attempt = 0
                     record(phase: "online", detail: "互联网连接正常。")
                     return
@@ -1241,7 +1362,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             state.detail = confirmingSession ? "正在确认校园网会话…" : "正在登录校园网…"
             publish(state: state, shouldNotify: false)
 
-            let outcome = authenticate(config, network.ip ?? "", stillConnected)
+            let outcome = authenticate(config, usableIP, stillConnected)
             guard stillConnected() else { continue }
             switch outcome.0 {
             case .online:
@@ -1260,6 +1381,10 @@ final class AutoLoginEngine: @unchecked Sendable {
                 record(phase: "retry", detail: detail)
                 // Bound one authentication round so the coordinator can fall back.
                 if state.attempt >= 3 { return }
+                let delayIndex = Int(state.attempt) - 1
+                if delayIndex >= 0 && delayIndex < retryDelays.count {
+                    sleepInterruptible(retryDelays[delayIndex], while: stillConnected)
+                }
                 continue
             case .networkChanged:
                 state.route = outcome.1
@@ -1269,11 +1394,40 @@ final class AutoLoginEngine: @unchecked Sendable {
         }
     }
 
+    private func waitForCampusIPv4(initial: WiFiNetwork) -> String? {
+        if let ip = initial.ip, usableIPv4(ip) { return ip }
+        guard ipWaitTimeout > 0 else { return nil }
+        let deadline = ProcessInfo.processInfo.systemUptime + ipWaitTimeout
+        while !cancellation.isCancelled() && ProcessInfo.processInfo.systemUptime < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            let current = snapshot.read()
+            guard current.permissionAuthorized, let campus = selectNetwork(current.networks) else { return nil }
+            if let ip = campus.ip, usableIPv4(ip) { return ip }
+        }
+        return nil
+    }
+
+    private func sleepInterruptible(_ duration: TimeInterval, while shouldContinue: () -> Bool) {
+        guard duration > 0 else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + duration
+        while shouldContinue() && ProcessInfo.processInfo.systemUptime < deadline {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            Thread.sleep(forTimeInterval: min(0.1, max(0.01, remaining)))
+        }
+    }
+
     private func record(phase: String, detail: String) {
+        let now = Int64(Date().timeIntervalSince1970)
         let oldNotified = state.notified
-        let changed = state.transition(phase: phase, detail: detail, now: Int64(Date().timeIntervalSince1970))
+        let changed = state.transition(phase: phase, detail: detail, now: now)
         let shouldNotify = !oldNotified && state.notified
-        if changed { logger.append(state: state) }
+        let logWorthy = phase != lastLoggedPhase || detail != lastLoggedDetail || (now - lastLoggedAt) >= 60
+        if changed && logWorthy {
+            lastLoggedPhase = phase
+            lastLoggedDetail = detail
+            lastLoggedAt = now
+            logger.append(state: state)
+        }
         if changed || shouldNotify {
             store.saveState(state)
             publish(state: state, shouldNotify: shouldNotify)
@@ -1308,11 +1462,18 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private var ownedHotspotSSID: String?
     private var ownedHotspotBSSID: String?
     private var pendingHotspotSSID: String?
+    private var lastRequestedHotspotSSID: String?
+    private var hotspotSearchStartedAt: ContinuousClock.Instant?
+    private var hotspotConfirmPollTask: Task<Void, Never>?
     private var profileRecognizesHotspot: Bool?
     private var profileLookupGeneration: UInt = 0
     private var profileLookupTime: ContinuousClock.Instant?
     private var campusAssociationFailures = 0
+    private var consecutiveCampusFallbacks = 0
     private var fallbackUntil: ContinuousClock.Instant?
+    private var wakeGraceUntil: ContinuousClock.Instant?
+    private var wakeGraceTask: Task<Void, Never>?
+    private var lastPathSignature: PathSignature?
     private var campusSearchTask: Task<Void, Never>?
     private var networkSleeping = false
     private var networkPathReady = false
@@ -1365,10 +1526,19 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         hotspot.changed = { [weak self] in
             guard let self else { return }
             self.pendingHotspotSSID = self.hotspot.requestedSSID
+            if let requested = self.hotspot.requestedSSID {
+                self.lastRequestedHotspotSSID = requested
+            }
             if self.hotspot.enabled {
+                if self.hotspotSearchStartedAt == nil {
+                    self.hotspotSearchStartedAt = ContinuousClock.now
+                }
                 self.wifiRecoveryDetail = self.hotspot.status
                 self.diagnosticText = self.hotspot.status
+            } else {
+                self.hotspotSearchStartedAt = nil
             }
+            self.updateHotspotConfirmPolling()
         }
         wifiRecovery.onResult = { [weak self] result in
             guard let self else { return }
@@ -1378,6 +1548,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
                 self.campusAssociationFailures = 0
                 self.ownedHotspotSSID = nil
                 self.ownedHotspotBSSID = nil
+                self.lastRequestedHotspotSSID = nil
                 self.wifiRecoveryDetail = "已连接校园 Wi-Fi，正在检查校园网登录。"
                 self.engine.request()
             case .absent:
@@ -1389,8 +1560,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
                 self.wifiRecoveryDetail = "连接校园 Wi-Fi 失败；请检查系统 Wi-Fi 设置。"
                 if self.campusAssociationFailures >= 3 {
                     self.campusAssociationFailures = 0
-                    self.fallbackUntil = ContinuousClock.now.advanced(by: .seconds(120))
-                    self.startHotspotIfAllowed()
+                    self.enterCampusFallback()
                 }
             case .failed(let message):
                 self.wifiRecoveryDetail = message
@@ -1409,16 +1579,25 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             guard let self else { return }
             self.internetStatus = status
             self.engineSnapshot.updateConnectivity(status.isConnected)
-            if status == .dnsStalled { self.engine.request() }
+            if status == .dnsStalled || status == .offline { self.engine.request() }
             self.recoverWiFiIfNeeded()
         }
         internetMonitor.start()
         pathMonitor.pathUpdateHandler = { [weak self] path in
+            let signature = PathSignature(path)
             Task { @MainActor [weak self] in
-                self?.networkPathReady = true
-                self?.engineSnapshot.invalidateNetwork()
-                self?.internetMonitor.reset(networkAvailable: path.status == .satisfied)
-                self?.requestCheck()
+                guard let self else { return }
+                let previousSignature = self.lastPathSignature
+                self.lastPathSignature = signature
+                self.networkPathReady = true
+                let refreshed = self.wifiMonitor.networks()
+                let wifiChanged = self.networks != refreshed
+                let pathChanged = previousSignature != signature
+                if pathChanged || wifiChanged || !signature.satisfied {
+                    self.engineSnapshot.invalidateNetwork()
+                    self.internetMonitor.reset(networkAvailable: signature.satisfied)
+                }
+                self.requestCheck()
             }
         }
         pathMonitor.start(queue: pathQueue)
@@ -1447,6 +1626,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         started = false
         connectivityTimer?.invalidate()
         connectivityTimer = nil
+        wakeGraceTask?.cancel()
+        wakeGraceTask = nil
+        hotspotConfirmPollTask?.cancel()
+        hotspotConfirmPollTask = nil
         internetMonitor.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         pathMonitor.cancel()
@@ -1456,10 +1639,58 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         wifiMonitor.stop()
         engine.stop()
         if ownsWiFiControl {
-            await hotspot.waitUntilIdle()
-            await wifiRecovery.waitUntilIdle()
+            await waitForIdleWithTimeout(.seconds(5))
             wifiControlLock.release()
             ownsWiFiControl = false
+        }
+    }
+
+    private func waitForIdleWithTimeout(_ timeout: Duration) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            var finished = false
+            var timeoutTask: Task<Void, Never>?
+            func complete() {
+                guard !finished else { return }
+                finished = true
+                timeoutTask?.cancel()
+                continuation.resume()
+            }
+            timeoutTask = Task {
+                do { try await Task.sleep(for: timeout) } catch { return }
+                NSLog("等待 Wi-Fi 控制器空闲超时，强制继续退出。")
+                complete()
+            }
+            Task {
+                await hotspot.waitUntilIdle()
+                await wifiRecovery.waitUntilIdle()
+                complete()
+            }
+        }
+    }
+
+    private func enterCampusFallback() {
+        consecutiveCampusFallbacks += 1
+        let cooldown = fallbackCooldownSeconds(consecutiveFallbacks: consecutiveCampusFallbacks)
+        fallbackUntil = ContinuousClock.now.advanced(by: .seconds(cooldown))
+        wifiRecovery.cancel()
+        startHotspotIfAllowed()
+    }
+
+    private func updateHotspotConfirmPolling() {
+        if hotspot.enabled && (hotspot.phase == .confirming || hotspot.phase == .joining) {
+            guard hotspotConfirmPollTask == nil else { return }
+            hotspotConfirmPollTask = Task { @MainActor [weak self] in
+                while let self, !Task.isCancelled, self.started,
+                      self.hotspot.enabled, (self.hotspot.phase == .confirming || self.hotspot.phase == .joining) {
+                    do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                    guard !Task.isCancelled, self.started else { return }
+                    self.refreshNetworks()
+                }
+                self?.hotspotConfirmPollTask = nil
+            }
+        } else {
+            hotspotConfirmPollTask?.cancel()
+            hotspotConfirmPollTask = nil
         }
     }
 
@@ -1526,6 +1757,11 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             hotspot.setEnabled(false)
             return
         }
+        if let grace = wakeGraceUntil, ContinuousClock.now < grace {
+            // Give macOS time after wake to re-associate with known Wi-Fi before taking over.
+            return
+        }
+        wakeGraceUntil = nil
         if let until = fallbackUntil, ContinuousClock.now < until {
             startHotspotIfAllowed()
             return
@@ -1536,12 +1772,19 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             hotspot.setEnabled(false)
             return
         }
-        // While joining, a link to the requested SSID is not yet proof of ownership.
-        // Wait for its address and path confirmation instead of cancelling the join.
-        if hotspot.busy {
+        let candidateHotspotSSID = pendingHotspotSSID ?? lastRequestedHotspotSSID
+        // Do not tear down an active hotspot discovery, join, confirmation, or retry cycle
+        // every 15 seconds. Allow a periodic campus re-check only after 60s of idle searching.
+        if shouldPauseCampusSearchForHotspot(enabled: hotspot.enabled, phase: hotspot.phase) {
             let linked = networks.filter { $0.ssid != nil || $0.bssid != nil || $0.ip != nil }
-            if linked.isEmpty || (pendingHotspotSSID != nil && linked.allSatisfy({ $0.ssid == pendingHotspotSSID })) { return }
-            hotspot.setEnabled(false)
+            let joinedOtherNetwork = !linked.isEmpty && (candidateHotspotSSID == nil || !linked.allSatisfy({ $0.ssid == candidateHotspotSSID }))
+            if joinedOtherNetwork {
+                hotspot.setEnabled(false)
+            } else if hotspot.busy {
+                return
+            } else if let startedAt = hotspotSearchStartedAt, ContinuousClock.now - startedAt < .seconds(60) {
+                return
+            }
         }
         let verifiedSSID = verifiedHotspotSSID(ownedHotspotSSID, bssid: ownedHotspotBSSID, networks: networks)
         guard maySelectCampus(networks: networks, permissionAuthorized: true, ownedHotspotSSID: verifiedSSID) else {
@@ -1550,6 +1793,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             if networks.contains(where: { $0.ssid != nil }) {
                 ownedHotspotSSID = nil
                 ownedHotspotBSSID = nil
+                lastRequestedHotspotSSID = nil
             }
             return
         }
@@ -1572,18 +1816,36 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     @objc private func networkWillSleep(_ notification: Notification) {
         networkSleeping = true
+        wakeGraceTask?.cancel()
+        wakeGraceTask = nil
+        wakeGraceUntil = nil
+        hotspotConfirmPollTask?.cancel()
+        hotspotConfirmPollTask = nil
         wifiRecovery.cancel()
         campusSearchTask?.cancel()
         hotspot.suspend()
         hotspot.setEnabled(false)
         fallbackUntil = nil
+        consecutiveCampusFallbacks = 0
         pendingHotspotSSID = nil
+        lastRequestedHotspotSSID = nil
+        hotspotSearchStartedAt = nil
+        lastPathSignature = nil
         engineSnapshot.invalidateNetwork()
         internetMonitor.reset(networkAvailable: false)
     }
 
     @objc private func networkDidWake(_ notification: Notification) {
         networkSleeping = false
+        consecutiveCampusFallbacks = 0
+        wakeGraceUntil = ContinuousClock.now.advanced(by: .seconds(6))
+        wakeGraceTask?.cancel()
+        wakeGraceTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(6)) } catch { return }
+            guard let self, self.started, !self.networkSleeping else { return }
+            self.wakeGraceUntil = nil
+            self.requestCheck()
+        }
         engineSnapshot.invalidateNetwork()
         internetMonitor.reset(networkAvailable: pathMonitor.currentPath.status == .satisfied)
         requestCheck()
@@ -1591,6 +1853,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     func checkNow() {
         manualCheckRequested = true
+        consecutiveCampusFallbacks = 0
+        fallbackUntil = nil
+        wakeGraceUntil = nil
         diagnosticText = "正在检查…"
         refreshNetworks()
         recoverWiFiIfNeeded()
@@ -1603,6 +1868,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
                 try store.saveConfig(newConfig)
                 config = newConfig
                 diagnosticText = "配置已保存。"
+                consecutiveCampusFallbacks = 0
                 fallbackUntil = nil
                 hotspot.setEnabled(false)
                 engineSnapshot.invalidateNetwork()
@@ -1664,10 +1930,11 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     private func apply(state: AppState, shouldNotify: Bool) {
         self.state = state
+        if state.phase == "online" {
+            consecutiveCampusFallbacks = 0
+        }
         if shouldFallbackForAuthentication(state, campus: selectNetwork(networks)), fallbackUntil == nil {
-            fallbackUntil = ContinuousClock.now.advanced(by: .seconds(120))
-            wifiRecovery.cancel()
-            startHotspotIfAllowed()
+            enterCampusFallback()
         }
         if manualCheckRequested && !state.checking {
             manualCheckRequested = false
@@ -1688,7 +1955,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     private func refreshNetworks() {
         let refreshed = wifiMonitor.networks()
-        if let pending = pendingHotspotSSID, hotspot.busy,
+        if let pending = pendingHotspotSSID ?? lastRequestedHotspotSSID,
+           (hotspot.busy || hotspot.enabled),
            let connected = refreshed.first(where: { $0.ssid == pending && $0.ip != nil && $0.bssid != nil }),
            pathMonitor.currentPath.status == .satisfied,
            pathMonitor.currentPath.usesInterfaceType(.wifi) {
@@ -1902,11 +2170,10 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func symbol(_ name: String) -> NSImage {
-        NSImage(systemSymbolName: name, accessibilityDescription: name)!
-            .withSymbolConfiguration(
-                NSImage.SymbolConfiguration(pointSize: 17, weight: .regular)
-                    .applying(.preferringHierarchical())
-            )!
+        let base = NSImage(systemSymbolName: name, accessibilityDescription: name) ?? NSImage(size: NSSize(width: 17, height: 17))
+        let config = NSImage.SymbolConfiguration(pointSize: 17, weight: .regular)
+            .applying(.preferringHierarchical())
+        return base.withSymbolConfiguration(config) ?? base
     }
 
     private func setConnectivity(_ connected: Bool) {
@@ -2222,6 +2489,7 @@ enum SelfTest {
         storeMigrationAndPersistence()
         engineCancellationAndMutex()
         authenticationAttemptsResetAfterSuccess()
+        authenticationWaitsForUsableIPv4AndBacksOff()
         manualLoginBypassesConnectivity()
         ClashConnectivitySelfTest.run()
         httpLogin(proxy: false)
@@ -2297,6 +2565,24 @@ enum SelfTest {
         ] {
             precondition(!maySelectCampus(networks: [disconnected, connected], permissionAuthorized: true, ownedHotspotSSID: nil))
         }
+        // Hotspot coordinator stability policies.
+        precondition(shouldPauseCampusSearchForHotspot(enabled: true, phase: .browsing))
+        precondition(shouldPauseCampusSearchForHotspot(enabled: true, phase: .retrying(.joining)))
+        precondition(shouldPauseCampusSearchForHotspot(enabled: true, phase: .activating))
+        precondition(!shouldPauseCampusSearchForHotspot(enabled: false, phase: .browsing))
+        precondition(!shouldPauseCampusSearchForHotspot(enabled: true, phase: .networkAvailable))
+        precondition(fallbackCooldownSeconds(consecutiveFallbacks: 1) == 120)
+        precondition(fallbackCooldownSeconds(consecutiveFallbacks: 2) == 240)
+        precondition(fallbackCooldownSeconds(consecutiveFallbacks: 3) == 480)
+        precondition(fallbackCooldownSeconds(consecutiveFallbacks: 4) == 600)
+        precondition(fallbackCooldownSeconds(consecutiveFallbacks: 9) == 600)
+        precondition(!campusCandidateEligible(rssi: -82, replacingHotspot: true))
+        precondition(campusCandidateEligible(rssi: -68, replacingHotspot: true))
+        precondition(campusCandidateEligible(rssi: -82, replacingHotspot: false))
+        let sigA = PathSignature(satisfied: true, usesWiFi: true, usesEthernet: false, isExpensive: false, interfaces: ["en0"], gateways: ["10.0.0.1"])
+        let sigB = PathSignature(satisfied: true, usesWiFi: true, usesEthernet: false, isExpensive: false, interfaces: ["en0"], gateways: ["10.0.0.1"])
+        let sigC = PathSignature(satisfied: true, usesWiFi: true, usesEthernet: false, isExpensive: true, interfaces: ["en0"], gateways: ["172.20.10.1"])
+        precondition(sigA == sigB && sigA != sigC)
     }
 
     private static func storeMigrationAndPersistence() {
@@ -2350,6 +2636,7 @@ enum SelfTest {
         let lockPath = lockRoot.appendingPathComponent("run.lock")
         do {
             let first = try! AppInstanceLock(path: lockPath)
+            precondition((fcntl(first.descriptor, F_GETFD) & FD_CLOEXEC) != 0)
             do {
                 _ = try AppInstanceLock(path: lockPath)
                 preconditionFailure("second instance acquired the run lock")
@@ -2360,6 +2647,7 @@ enum SelfTest {
             }
             _ = first
         }
+        try? FileManager.default.removeItem(at: lockPath)
         _ = try! AppInstanceLock(path: lockPath)
 
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("csust-engine-test-\(UUID().uuidString)")
@@ -2431,7 +2719,7 @@ enum SelfTest {
         let firstSuccess = DispatchSemaphore(value: 0)
         let laterFailure = DispatchSemaphore(value: 0)
         let observed = LockedAppState()
-        let engine = AutoLoginEngine(store: store, snapshot: snapshot, authenticate: { _, _, _ in
+        let engine = AutoLoginEngine(store: store, snapshot: snapshot, retryDelays: [], authenticate: { _, _, _ in
             let count = (Int(calls.get()) ?? 0) + 1
             calls.set(String(count))
             return (count == 3 || count >= 5 ? .online : .retry("temporary"), "direct")
@@ -2451,6 +2739,48 @@ enum SelfTest {
         engine.checkNow()
         precondition(laterFailure.wait(timeout: .now() + 3) == .success)
         precondition(observed.get().attempt == 1)
+        engine.stop()
+    }
+
+    private static func authenticationWaitsForUsableIPv4AndBacksOff() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("csust-ipwait-test-\(UUID().uuidString)")
+        let paths = AppPaths(data: root, legacyConfig: root.appendingPathComponent("config.json"),
+                             legacyState: root.appendingPathComponent("state.json"), logs: root.appendingPathComponent("logs"))
+        let suiteName = "csust-ipwait-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = AppStore(defaults: defaults, paths: paths)
+        try! store.saveConfig(AppConfig(username: "account", password: "password"))
+        let snapshot = EngineSnapshot()
+        // Connected to campus SSID without an IPv4 lease yet: must not send empty-IP login requests.
+        snapshot.update(networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: nil)], permissionAuthorized: true)
+        let calls = LockedString()
+        let waited = DispatchSemaphore(value: 0)
+        let observed = LockedAppState()
+        let engine = AutoLoginEngine(store: store, snapshot: snapshot, retryDelays: [0.05, 0.05], ipWaitTimeout: 0.25, authenticate: { _, ip, _ in
+            calls.set(ip)
+            return (.retry("temporary"), "direct")
+        }, onUpdate: { state, _, _ in
+            observed.set(state)
+            if !state.checking && (state.phase == "waiting_ip" || (state.phase == "retry" && state.attempt >= 3)) {
+                waited.signal()
+            }
+        })
+        engine.start()
+        precondition(waited.wait(timeout: .now() + 3) == .success)
+        precondition(calls.get().isEmpty, "Must not call authenticate without a usable IPv4")
+        precondition(observed.get().phase == "waiting_ip" && observed.get().attempt == 0)
+        // Once DHCP assigns a valid IPv4, retries back off instead of looping instantaneously.
+        let started = Date()
+        snapshot.update(networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: "aa", ip: "10.183.0.2")], permissionAuthorized: true)
+        engine.request()
+        precondition(waited.wait(timeout: .now() + 3) == .success)
+        precondition(calls.get() == "10.183.0.2")
+        precondition(observed.get().attempt == 3)
+        precondition(Date().timeIntervalSince(started) >= 0.08, "Retries must wait between attempts")
         engine.stop()
     }
 

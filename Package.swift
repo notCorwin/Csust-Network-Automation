@@ -6,7 +6,7 @@ let hotspotDependency: Package.Dependency
 if let localPath = ProcessInfo.processInfo.environment["LOCAL_HOTSPOT_PATH"], !localPath.isEmpty {
     hotspotDependency = .package(path: localPath)
 } else {
-    hotspotDependency = .package(url: "https://github.com/notCorwin/Sequoia-Hotspot.git", revision: "4b99d21a4cf1d61f26b3dba7794273d7e53a7419")
+    hotspotDependency = .package(url: "https://github.com/notCorwin/Sequoia-Hotspot.git", revision: "c61dbcbca15696b56f14ac8960cbb5ac585d03af")
 }
 
 let projectRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()

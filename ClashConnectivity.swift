@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import HotspotCore
 
 enum InternetStatus: Equatable, Sendable {
     case online
@@ -28,9 +29,9 @@ enum InternetStatus: Equatable, Sendable {
     var detail: String {
         switch self {
         case .dnsStalled:
-            "检测到至少两条连接指向同一 Clash 内部 DNS 候选目标，按断线处理。"
+            "检测到持续多秒的重复 Clash 内部 DNS 连接，按断线处理。"
         default:
-            "根据 Clash 实际代理连接的近期收包判断；没有流量不代表断网。"
+            "结合 Clash 代理近期收包与轻量连通性探测判断；没有流量不代表断网。"
         }
     }
 }
@@ -158,14 +159,16 @@ enum ClashConnectivitySelfTest {
         precondition(!snapshotState.read().internetConnected)
         dnsStalls()
         var closePolicy = OutageClosePolicy()
-        precondition(closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: true))
-        precondition(closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: true))
-        precondition(!closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: false))
-        precondition(!closePolicy.shouldClose(for: .unknown, fromSnapshot: true))
-        precondition(closePolicy.shouldClose(for: .offline, fromSnapshot: false))
-        precondition(!closePolicy.shouldClose(for: .offline, fromSnapshot: false))
-        precondition(!closePolicy.shouldClose(for: .online, fromSnapshot: true))
-        precondition(closePolicy.shouldClose(for: .offline, fromSnapshot: false))
+        precondition(closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: true, now: 100))
+        // Cooldown prevents killing all Clash connections every single second.
+        precondition(!closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: true, now: 105))
+        precondition(closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: true, now: 116))
+        precondition(!closePolicy.shouldClose(for: .dnsStalled, fromSnapshot: false, now: 135))
+        precondition(!closePolicy.shouldClose(for: .unknown, fromSnapshot: true, now: 136))
+        precondition(closePolicy.shouldClose(for: .offline, fromSnapshot: false, now: 137))
+        precondition(!closePolicy.shouldClose(for: .offline, fromSnapshot: false, now: 138))
+        precondition(!closePolicy.shouldClose(for: .online, fromSnapshot: true, now: 139))
+        precondition(closePolicy.shouldClose(for: .offline, fromSnapshot: false, now: 140))
         ipcSnapshot()
     }
 
@@ -187,28 +190,35 @@ enum ClashConnectivitySelfTest {
         )
         var evidence = ClashTrafficEvidence()
         precondition(evidence.observe(snapshot([first]), now: 0) == .unknown)
-        // Two simultaneous connections to the same resolver signal an interruption immediately.
-        precondition(evidence.observe(snapshot([first, duplicate, internet]), now: 1) == .dnsStalled)
-        precondition(!evidence.status(now: 1).isConnected)
+        // A transient burst of concurrent DNS queries must not trigger a false outage.
+        precondition(evidence.observe(snapshot([first, duplicate, internet]), now: 1) == .online)
+        precondition(evidence.observe(snapshot([first, duplicate, internet]), now: 2) == .online)
+        // Persistent duplicate DNS connections across >= 3 seconds signal a genuine stall.
+        precondition(evidence.observe(snapshot([first, duplicate, internet]), now: 4) == .dnsStalled)
+        precondition(!evidence.status(now: 4).isConnected)
         // Recovery requires new traffic after the duplicate connections disappear.
-        precondition(evidence.observe(snapshot([first, internet]), now: 2) == .unknown)
+        precondition(evidence.observe(snapshot([first, internet]), now: 5) == .unknown)
         let recoveredInternet = ClashConnections.Connection(
             id: internet.id, metadata: internet.metadata, download: 2, upload: 10, chains: internet.chains
         )
-        precondition(evidence.observe(snapshot([first, recoveredInternet]), now: 3) == .online)
-        precondition(evidence.observe(snapshot([first, duplicate, recoveredInternet]), now: 4) == .dnsStalled)
+        precondition(evidence.observe(snapshot([first, recoveredInternet]), now: 6) == .online)
+        // Transient duplicate burst while online does not immediately kill connectivity.
+        precondition(evidence.observe(snapshot([first, duplicate, recoveredInternet]), now: 7) == .online)
+        precondition(evidence.observe(snapshot([first, duplicate, recoveredInternet]), now: 10) == .dnsStalled)
         evidence.reset()
-        precondition(evidence.status(now: 3) == .unknown)
+        precondition(evidence.status(now: 10) == .unknown)
         // Different endpoints and excluded connections do not count as duplicates.
         for other in [connection("other", ip: "223.6.6.6"), connection("other", port: "853"),
                       connection("other", type: "Tun"), connection("other", ip: "192.168.1.1"),
                       connection("other", port: "123")] {
             evidence.reset()
             precondition(evidence.observe(snapshot([first, other]), now: 0) == .unknown)
+            precondition(evidence.observe(snapshot([first, other]), now: 5) == .unknown)
         }
-        // The rule uses concurrent connections, regardless of their byte counters.
-        precondition(evidence.observe(snapshot([connection("a", download: 4000), connection("b", download: 4000)]), now: 1) == .dnsStalled)
-        precondition(evidence.observe(snapshot([], total: 0), now: 2) == .unknown)
+        // Sustained concurrent connections to the same DNS endpoint still stall regardless of byte counters.
+        precondition(evidence.observe(snapshot([connection("a", download: 4000), connection("b", download: 4000)]), now: 1) == .unknown)
+        precondition(evidence.observe(snapshot([connection("a", download: 4000), connection("b", download: 4000)]), now: 4) == .dnsStalled)
+        precondition(evidence.observe(snapshot([], total: 0), now: 5) == .unknown)
     }
 
     private static func ipcSnapshot() {
@@ -265,8 +275,10 @@ enum ClashConnectivitySelfTest {
 
 struct ClashTrafficEvidence {
     static let lifetime: TimeInterval = 30
+    static let duplicateDNSSustainDuration: TimeInterval = 3
     private var downloads: [String: Int64] = [:]
-    private var hasDuplicateDNS = false
+    private var duplicateDNSSince: TimeInterval?
+    private var hasSustainedDuplicateDNS = false
     private var total: Int64?
     private var lastReply: TimeInterval?
 
@@ -278,7 +290,8 @@ struct ClashTrafficEvidence {
 
     mutating func reset() {
         downloads.removeAll(keepingCapacity: true)
-        hasDuplicateDNS = false
+        duplicateDNSSince = nil
+        hasSustainedDuplicateDNS = false
         total = nil
         lastReply = nil
     }
@@ -303,16 +316,23 @@ struct ClashTrafficEvidence {
             }
         }
         downloads = next
-        hasDuplicateDNS = duplicateDNS
-        // Only traffic received after the duplicate connections clear can confirm recovery.
-        if duplicateDNS { lastReply = nil }
+        if duplicateDNS {
+            let since = duplicateDNSSince ?? now
+            duplicateDNSSince = since
+            hasSustainedDuplicateDNS = now >= since && (now - since) >= Self.duplicateDNSSustainDuration
+        } else {
+            duplicateDNSSince = nil
+            hasSustainedDuplicateDNS = false
+        }
+        // Only traffic received after the sustained duplicate connections clear can confirm recovery.
+        if hasSustainedDuplicateDNS { lastReply = nil }
         total = snapshot.downloadTotal
         return status(now: now)
     }
 
     func status(now: TimeInterval) -> InternetStatus {
+        if hasSustainedDuplicateDNS { return .dnsStalled }
         let connected = lastReply.map { now >= $0 && now - $0 < Self.lifetime } ?? false
-        if hasDuplicateDNS { return .dnsStalled }
         return connected ? .online : .unknown
     }
 }
@@ -454,11 +474,24 @@ enum ClashController {
 }
 
 struct OutageClosePolicy {
+    static let dnsCloseCooldown: TimeInterval = 15
     private var attempted = false
+    private var lastDNSCloseAt: TimeInterval?
 
-    mutating func shouldClose(for status: InternetStatus, fromSnapshot: Bool) -> Bool {
-        if status == .dnsStalled { return fromSnapshot }
-        if status == .online { attempted = false }
+    mutating func shouldClose(for status: InternetStatus, fromSnapshot: Bool,
+                              now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        if status == .dnsStalled {
+            guard fromSnapshot else { return false }
+            if let last = lastDNSCloseAt, now >= last, now - last < Self.dnsCloseCooldown {
+                return false
+            }
+            lastDNSCloseAt = now
+            return true
+        }
+        if status == .online {
+            attempted = false
+            lastDNSCloseAt = nil
+        }
         guard status == .offline, !attempted else { return false }
         attempted = true
         return true
@@ -479,6 +512,13 @@ final class ClashConnectivityMonitor {
     private let queue = DispatchQueue(label: "com.nowaywastaken.networkauto.clash", qos: .utility)
     private var networkAvailable = true
     private var outageClosePolicy = OutageClosePolicy()
+    private var probeTask: Task<Void, Never>?
+    private var lastProbeSuccessAt: TimeInterval?
+    private var nextProbeAt: TimeInterval = 0
+    private var consecutiveProbeFailures = 0
+    private var generation: UInt = 0
+    private static let activeProbeLifetime: TimeInterval = 35
+    private static let activeProbeInterval: TimeInterval = 25
 
     func start() {
         guard timer == nil else { return }
@@ -497,8 +537,14 @@ final class ClashConnectivityMonitor {
     }
 
     func reset(networkAvailable: Bool? = nil) {
+        generation &+= 1
         if let networkAvailable { self.networkAvailable = networkAvailable }
         cancelRequest()
+        probeTask?.cancel()
+        probeTask = nil
+        lastProbeSuccessAt = nil
+        nextProbeAt = 0
+        consecutiveProbeFailures = 0
         evidence.reset()
         retryAt = 0
         publish(self.networkAvailable ? .unknown : .offline)
@@ -509,14 +555,22 @@ final class ClashConnectivityMonitor {
         let now = ProcessInfo.processInfo.systemUptime
         guard networkAvailable else { return }
         guard request == nil else { return }
-        if status != .clashUnavailable { publish(evidence.status(now: now)) }
-        guard now >= retryAt else { return }
+        if status != .clashUnavailable {
+            publish(effectiveStatus(passive: evidence.status(now: now), now: now))
+        }
+        guard now >= retryAt else {
+            maybeRunActiveProbe(now: now)
+            return
+        }
         if socketPaths.isEmpty { socketPaths = ClashController.socketPaths() }
-        guard let socketPath = socketPaths.first else { failed(); return }
+        guard let socketPath = socketPaths.first else {
+            failed()
+            maybeRunActiveProbe(now: now)
+            return
+        }
         let identity = ClashController.socketIdentity(socketPath)
         if socketIdentity != identity {
             evidence.reset()
-            publish(.unknown)
             socketIdentity = identity
         }
         let cancellation = CancellationSignal()
@@ -528,14 +582,61 @@ final class ClashConnectivityMonitor {
             Task { @MainActor [weak self] in
                 guard let self, self.requestID == id, self.timer != nil else { return }
                 self.request = nil
+                let now = ProcessInfo.processInfo.systemUptime
                 switch result {
                 case .success(let snapshot):
-                    let status = self.evidence.observe(snapshot, now: ProcessInfo.processInfo.systemUptime)
-                    if self.outageClosePolicy.shouldClose(for: status, fromSnapshot: true) {
+                    let passive = self.evidence.observe(snapshot, now: now)
+                    if passive == .online {
+                        self.consecutiveProbeFailures = 0
+                        self.probeTask?.cancel()
+                        self.probeTask = nil
+                    } else if passive == .dnsStalled {
+                        self.lastProbeSuccessAt = nil
+                    }
+                    if self.outageClosePolicy.shouldClose(for: passive, fromSnapshot: true, now: now) {
                         self.closeConnections(path: socketPath)
                     }
-                    self.publish(status)
-                case .failure: self.failed()
+                    let effective = self.effectiveStatus(passive: passive, now: now)
+                    self.publish(effective)
+                    if passive == .unknown {
+                        self.maybeRunActiveProbe(now: now)
+                    }
+                case .failure:
+                    self.failed()
+                    self.maybeRunActiveProbe(now: now)
+                }
+            }
+        }
+    }
+
+    private func effectiveStatus(passive: InternetStatus, now: TimeInterval) -> InternetStatus {
+        if passive == .dnsStalled || passive == .online { return passive }
+        if let verified = lastProbeSuccessAt, now >= verified, now - verified < Self.activeProbeLifetime {
+            return .online
+        }
+        if consecutiveProbeFailures >= 2 { return .offline }
+        return passive
+    }
+
+    private func maybeRunActiveProbe(now: TimeInterval) {
+        guard timer != nil, networkAvailable, probeTask == nil, now >= nextProbeAt else { return }
+        let token = generation
+        probeTask = Task { @MainActor [weak self] in
+            let reachable = await InternetConnectivityProbe.check(timeout: 4)
+            guard let self, self.generation == token, self.timer != nil, self.networkAvailable else { return }
+            self.probeTask = nil
+            let finishNow = ProcessInfo.processInfo.systemUptime
+            if reachable {
+                self.consecutiveProbeFailures = 0
+                self.lastProbeSuccessAt = finishNow
+                self.nextProbeAt = finishNow + Self.activeProbeInterval
+                self.publish(.online)
+            } else {
+                self.lastProbeSuccessAt = nil
+                self.consecutiveProbeFailures += 1
+                self.nextProbeAt = finishNow + (self.consecutiveProbeFailures >= 2 ? 10 : 2)
+                if self.consecutiveProbeFailures >= 2 {
+                    self.publish(.offline)
                 }
             }
         }
@@ -552,8 +653,10 @@ final class ClashConnectivityMonitor {
         if !socketPaths.isEmpty { socketPaths.removeFirst() }
         socketIdentity = nil
         evidence.reset()
-        retryAt = ProcessInfo.processInfo.systemUptime + (socketPaths.isEmpty ? 5 : 1)
-        publish(.clashUnavailable)
+        let now = ProcessInfo.processInfo.systemUptime
+        retryAt = now + (socketPaths.isEmpty ? 5 : 1)
+        let effective = effectiveStatus(passive: .clashUnavailable, now: now)
+        publish(effective)
     }
 
     private func publish(_ status: InternetStatus) {

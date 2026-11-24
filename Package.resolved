@@ -1,12 +1,12 @@
 {
-  "originHash" : "52802a5bb53949975c363ea215292f488af567136b19092a2375514a7bb00159",
+  "originHash" : "9ca2f3b12ec99dad5a7fefcabc472816f79e387445bca6d4123bf4bc5315b204",
   "pins" : [
     {
       "identity" : "sequoia-hotspot",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/notCorwin/Sequoia-Hotspot.git",
       "state" : {
-        "revision" : "4b99d21a4cf1d61f26b3dba7794273d7e53a7419"
+        "revision" : "c61dbcbca15696b56f14ac8960cbb5ac585d03af"
       }
     }
   ],

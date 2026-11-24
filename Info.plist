@@ -26,6 +26,8 @@
 	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>用于读取当前 Wi‑Fi 名称，以确认是否连接校园网络。</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>用于在校园网不可用时发现并唤起同一 Apple 账户设备的个人热点。</string>
 	<key>NSUserNotificationUsageDescription</key>
 	<string>用于报告自动登录失败、权限问题和恢复状态。</string>
 </dict>
