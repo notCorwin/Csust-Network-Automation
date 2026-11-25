@@ -28,7 +28,13 @@ stop_old_service() {
 }
 
 app_pids() {
-  ps -axo pid=,command= | awk '$2 ~ /\/(NetworkAuto\.app\/Contents\/MacOS\/NetworkAuto|CampusAutoLogin\.app\/Contents\/MacOS\/CampusAutoLogin)$/ { print $1 }'
+  ps -axo pid=,command= | awk '{
+    pid = $1
+    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "")
+    if ($0 ~ /\/(NetworkAuto\.app\/Contents\/MacOS\/NetworkAuto|CampusAutoLogin\.app\/Contents\/MacOS\/CampusAutoLogin)$/) {
+      print pid
+    }
+  }'
 }
 
 legacy_apps() {
